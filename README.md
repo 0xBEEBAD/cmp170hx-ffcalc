@@ -73,7 +73,7 @@ FFPROBE <字段名> <寄存器物理地址> <32bit值>
 
 ## 已确认 / 待验证
 
-- 三张实卡数据（2026-02 采集）：两张 80 GiB 潜力（10 FBP），一张 64 GiB 封顶（defective 0x2d）；defective 底线全部读到，option word 映射与博客差分一致
+- 三张实卡数据：两张 80 GiB 潜力（10 FBP），一张 64 GiB 封顶（很郁闷。。）（defective 0x2d）；defective 底线全部读到，option word 映射与博客数据一致
 - `DISABLE_GEN3_SPEED` 是 block39 的 bit1 还是 bit9 未定（上游未解决），默认两个都清
 - FF 链 CRC 是否由控制器在烧写时自动重算未验证——先 `--only fbp_disable` 烧一行，冷启动后读 `CRC_STATUS==0x55`，通过再烧全量
 - MIG / ECC / NVDEC 解锁（`sys_pipe_disable`）作者标注 untested
@@ -83,7 +83,7 @@ FFPROBE <字段名> <寄存器物理地址> <32bit值>
 ## 仓库结构
 
 ```
-ffcalc/optionmap.py    option word ↔ FF chain/bit 映射（照抄博客差分表）
+ffcalc/optionmap.py    option word ↔ FF chain/bit 映射（照抄博客数据表）
 ffcalc/ffrecord.py     FF 32-bit 记录编解码 + 链回放
 ffcalc/analyze.py      潜力分析（FB/SM/NVLink/PCIe）
 ffcalc/generate.py     烧写计划生成（16-bit 块合并、行分配）
@@ -98,11 +98,11 @@ tests/                       unittest，无外部依赖
 
 ## 测试环境
 
-Debian 12，内核 6.18.x-trim，nvidia-open 610.x（cmpunlocker 补丁版）。sysfs `resource0` mmap 在该内核上对 NVIDIA BAR0 返回 EINVAL（BAR1/3 正常），因此默认走内核模块；其他内核可先试 `ffcalc/capture.py`。
+Debian 12，内核 6.18.x-trim，nvidia-open 610.x（cmpunlocker  p2p补丁版 + shim rebar1 修复）。sysfs `resource0` mmap 在该内核上对 NVIDIA BAR0 返回 EINVAL（BAR1/3 正常），因此默认走内核模块；其他内核可先试 `ffcalc/capture.py`。
 
 ## 数据来源与致谢
 
-寄存器地址与 option word 位映射来自 [kate-land / ga100vfi](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/) 的社区差分研究，非 NVIDIA 官方文档。本工具与 [cmpunlocker](https://github.com/amoghmunikote/cmpunlocker) 无代码依赖。
+寄存器地址与 option word 位映射来自 [kate-land / ga100vfi](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/) 的社区研究，非 NVIDIA 官方文档。本工具与 [cmpunlocker] 无代码依赖。
 
 ## License
 
