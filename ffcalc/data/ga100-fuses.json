@@ -1,0 +1,58 @@
+{
+  "note": "GA100 BAR0 fuse readout map, vendored from community research (kate-land/ga100vfi gpu0-capture data + GA100 public headers). Addresses only; no code dependency.",
+  "fields": {
+    "fbio_disable": { "fused": "0x0082036c", "status": "0x00820c14" },
+    "fbpa_disable": { "fused": "0x00820368", "status": "0x00820c18" },
+    "gpc_disable":  { "fused": "0x00820350", "status": "0x00820c1c" },
+    "tpc_gpc0_disable": { "fused": "0x00820760", "status": "0x00820c38" },
+    "tpc_gpc1_disable": { "fused": "0x00820764", "status": "0x00820c3c" },
+    "tpc_gpc2_disable": { "fused": "0x00820768", "status": "0x00820c40" },
+    "tpc_gpc3_disable": { "fused": "0x0082076c", "status": "0x00820c44" },
+    "tpc_gpc4_disable": { "fused": "0x00820770", "status": "0x00820c48" },
+    "tpc_gpc5_disable": { "fused": "0x00820774", "status": "0x00820c4c" },
+    "tpc_gpc6_disable": { "fused": "0x00820778", "status": "0x00820c50" },
+    "tpc_gpc7_disable": { "fused": "0x0082077c", "status": "0x00820c54" },
+    "pes_disable":    { "fused": "0x00820690", "status": null },
+    "fbp_disable":    { "fused": "0x00820364", "status": "0x00820d38" },
+    "rop_l2_disable": { "fused": "0x008202c4", "status": null },
+    "nvlink_disable":    { "fused": "0x00820684", "status": "0x00820db8" },
+    "sys_pipe_disable":  { "fused": "0x008203a4", "status": "0x00820e30" },
+    "pcie_devida":  { "fused": "0x008204d8", "status": null },
+    "pcie_devidb":  { "fused": "0x0082056c", "status": null }
+  },
+  "bit_fields": {
+    "disable_gen3_speed_bit1": { "reg": "0x00820250", "bit": 1 },
+    "disable_gen3_speed_bit9": { "reg": "0x00820250", "bit": 9 },
+    "pcie_magic_gen4_dis":     { "reg": "0x00820520", "bit": 3 },
+    "pcie_boot_gen23_dis":     { "reg": "0x0082057c", "bit": 6 },
+    "pcie_boot_gen3_dis":      { "reg": "0x00820580", "bit": 7 }
+  },
+  "defective": {
+    "fbio_defective":   "0x008205d4",
+    "fbpa_defective":   "0x008205d0",
+    "gpc_defective":    "0x008205c4",
+    "tpc_gpc0_defective": "0x008205c8",
+    "tpc_gpc1_defective": "0x00820508",
+    "tpc_gpc2_defective": "0x0082050c",
+    "tpc_gpc3_defective": "0x00820514",
+    "tpc_gpc4_defective": "0x00820564",
+    "tpc_gpc5_defective": "0x008205ac",
+    "tpc_gpc6_defective": "0x00820b84",
+    "tpc_gpc7_defective": "0x00820b80",
+    "pes_defective":    "0x00820698",
+    "fbp_defective":    "0x008205cc",
+    "rop_l2_defective": "0x008205e8",
+    "nvlink_defective": "0x0082068c",
+    "sys_pipe_defective": "0x008203ac"
+  },
+  "info": {
+    "secured_burn_feature_enable": "0x00821108",
+    "nvdec_disable": "0x00820378",
+    "status_fb_config": "0x00820c34",
+    "status_half_fbpa": "0x00820c00",
+    "status_half_ltc": "0x00820c10",
+    "status_nvdec": "0x00820c24",
+    "status_nvjpg": "0x00820c0c",
+    "status_pcie_lane": "0x00820c2c"
+  }
+}
