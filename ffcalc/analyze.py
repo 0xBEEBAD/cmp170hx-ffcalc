@@ -1,4 +1,4 @@
-from . import ffrecord
+from . import ffrecord, ffrows
 from .optionmap import (BY_KEY, FIELDS, FF_ROW_MAX, FF_ROW_MIN, TOTAL_FBP,
                         TOTAL_GPC, TPC_PER_GPC, SM_PER_TPC, BYTES_PER_FBP,
                         popcount)
@@ -103,6 +103,7 @@ def analyze(dump, overrides=None):
         "sku": dump["sku"],
         "uuid": dump.get("uuid"),
         "fingerprint": dump.get("fingerprint"),
+        "ff_rows_state": ffrows.coverage(dump)[0],
         "ff_rows_used": len(used_ff_rows(dump)),
         "ff_rows_free": len(free_ff_rows(dump)),
         "current": decode_current(replay_blocks(dump)),

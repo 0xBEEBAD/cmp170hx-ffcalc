@@ -1,10 +1,14 @@
-from . import ffrecord
+from . import ffrecord, ffrows
 from .analyze import analyze, replay_blocks, used_ff_rows
 from .optionmap import (FIELDS, FF_ROW_MAX, FF_ROW_MIN, blocks_touched,
                         get_bits, set_bits)
 
 
 def plan(dump, only=None, skip=(), overrides=None):
+    # Without a complete FF-row snapshot we cannot know which rows are
+    # occupied or what the current block values are; refuse rather than
+    # append records onto already-burnt rows.
+    ffrows.require(dump, "generate a burn plan")
     rep = analyze(dump, overrides)
     targets = rep["targets"]
     warnings = list(rep["warnings"])

@@ -70,12 +70,20 @@ def build_rows(values):
     return rows
 
 
+FF_ROW_MIN, FF_ROW_MAX = 222, 486
+
+
 def main():
+    rows = build_rows(dict(EFFECTIVE, **PCIE_EFFECTIVE))
+    # A real readout lists every FF row; unburnt rows read back as 0.
+    for r in range(FF_ROW_MIN, FF_ROW_MAX + 1):
+        rows.setdefault(r, "0x00000000")
     dump = {
         "sku": "8gb",
         "comment": "synthetic dump modeled on kate-land blog card "
-                   "(FBP_DISABLE=0x852, FBP_DEFECTIVE=0x840)",
-        "ff_rows": build_rows(dict(EFFECTIVE, **PCIE_EFFECTIVE)),
+                   "(FBP_DISABLE=0x852, FBP_DEFECTIVE=0x840); FF region "
+                   "fully listed, unburnt rows = 0",
+        "ff_rows": rows,
         "option_words": dict(EFFECTIVE, **DEFECTIVE),
     }
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -83,8 +91,9 @@ def main():
     with io.open(out, "w", encoding="utf-8") as f:
         json.dump(dump, f, indent=2, sort_keys=True)
     print(out)
-    for r in sorted(dump["ff_rows"], key=lambda x: int(x)):
-        print("  row %s = %s" % (r, dump["ff_rows"][r]))
+    for r in sorted(rows, key=lambda x: int(x)):
+        if int(rows[r], 0):
+            print("  row %s = %s" % (r, rows[r]))
 
 
 if __name__ == "__main__":

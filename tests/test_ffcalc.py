@@ -4,12 +4,21 @@ import shutil
 import tempfile
 import unittest
 
-from ffcalc import cli, ffrecord, ingest
+from ffcalc import cli, ffmacro, ffrecord, ffrows, ingest
 from ffcalc.analyze import analyze
 from ffcalc.dump import load_dump
 from ffcalc.generate import plan
 from ffcalc.optionmap import BY_KEY
 from ffcalc.simulate import simulate
+
+
+def write_rows_file(dump, path):
+    with open(path, "w") as f:
+        f.write("# physical FF row readout (CMD_READ), unburnt = 0\n")
+        for r, v in sorted(dump["ff_rows"].items()):
+            r = int(r, 0) if isinstance(r, str) else r
+            f.write("%d %s\n" % (r, v))
+    return path
 
 SAMPLE = os.path.join(os.path.dirname(__file__), "..",
                       "samples", "blog_card_example.json")
@@ -88,6 +97,99 @@ class TestDump(unittest.TestCase):
         self.assertTrue(any("does not contain defective" in w
                             for w in obj["warnings"]))
 
+    def test_plan_refused_without_ff_rows(self):
+        for rows in ({}, {222: 0x141, 223: 0x181}):
+            dump = dict(self.dump, ff_rows=rows)
+            with self.assertRaises(ffrows.FFRowsNotRead):
+                plan(dump)
+
+    def test_sim_refused_without_ff_rows(self):
+        obj = plan(self.dump)
+        res = simulate(dict(self.dump, ff_rows={}), obj)
+        self.assertTrue(any("ff rows readout" in e for e in res["errors"]))
+
+
+class TestFfRowsParsing(unittest.TestCase):
+    def test_formats(self):
+        rows = ffrows.parse_rows(
+            "# comment\n"
+            "222 0x0fe805c1\n"
+            "0xde 0xfe805c1\n"
+            "FFROW 223 141\n"
+            "[ 1569.145419] FFROW 224 0x19801c1   # trailing comment\n"
+            "486 0\n")
+        self.assertEqual(rows[222], 0x0fe805c1)
+        self.assertEqual(rows[223], 141)
+        self.assertEqual(rows[224], 0x19801c1)
+        self.assertEqual(rows[486], 0)
+
+    def test_bad_lines(self):
+        with self.assertRaises(ValueError):
+            ffrows.parse_rows("222\n")
+        with self.assertRaises(ValueError):
+            ffrows.parse_rows("512 0\n")
+        with self.assertRaises(ValueError):
+            ffrows.parse_rows("222 0x100000000\n")
+        with self.assertRaises(ValueError):
+            ffrows.parse_rows("222 1\n222 2\n")
+        ffrows.parse_rows("222 1\n222 0x1\n")
+
+    def test_coverage_states(self):
+        self.assertEqual(ffrows.coverage({"ff_rows": {}})[0], "missing")
+        self.assertEqual(ffrows.coverage({"ff_rows": {"0": 5}})[0], "missing")
+        self.assertEqual(ffrows.coverage({"ff_rows": {"222": 1}})[0],
+                         "partial")
+        full = dict((r, 0) for r in range(222, 487))
+        self.assertEqual(ffrows.coverage({"ff_rows": full})[0], "complete")
+
+
+class TestMergeffCli(unittest.TestCase):
+    def setUp(self):
+        self.dump = load_dump(SAMPLE)
+        self.tmp = tempfile.mkdtemp(prefix="ffcalc-merge-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.card = os.path.join(self.tmp, "card.json")
+        with open(self.card, "w") as f:
+            json.dump({"sku": "8gb", "ff_rows": {}}, f)
+        self.rows = write_rows_file(self.dump,
+                                    os.path.join(self.tmp, "rows.txt"))
+
+    def test_gen_refused_then_available(self):
+        out = os.path.join(self.tmp, "plan.json")
+        rc = cli.main(["gen", self.card, "-o", out])
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(out))
+        self.assertEqual(cli.main(["mergeff", self.card, self.rows]), 0)
+        rc = cli.main(["gen", self.card, "-o", out])
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            obj = json.load(f)
+        self.assertTrue(all(r["row"] >= 240 for r in obj["burn"]))
+
+    def test_mergeff_partial_still_refused(self):
+        partial = os.path.join(self.tmp, "partial.txt")
+        with open(partial, "w") as f:
+            for r, v in sorted(self.dump["ff_rows"].items()):
+                if r != 486:
+                    f.write("%s %s\n" % (r, v))
+        rc = cli.main(["mergeff", self.card, partial])
+        self.assertEqual(rc, 1)
+        rc = cli.main(["gen", self.card, "-o",
+                       os.path.join(self.tmp, "plan.json")])
+        self.assertEqual(rc, 2)
+
+    def test_sim_with_ffrows_option(self):
+        self.assertEqual(cli.main(["mergeff", self.card, self.rows]), 0)
+        plan_path = os.path.join(self.tmp, "plan.json")
+        cli.main(["gen", self.card, "-o", plan_path])
+        empty = os.path.join(self.tmp, "empty.json")
+        with open(empty, "w") as f:
+            json.dump({"sku": "8gb", "ff_rows": {}}, f)
+        rc = cli.main(["sim", empty, plan_path])
+        self.assertEqual(rc, 1)
+        rc = cli.main(["sim", empty, plan_path, "--ffrows", self.rows])
+        self.assertEqual(rc, 0)
+
 
 class TestUuidMismatch(unittest.TestCase):
     def setUp(self):
@@ -106,6 +208,90 @@ class TestUuidMismatch(unittest.TestCase):
         self.assertEqual(obj["uuid"], self.dump["uuid"])
         res = simulate(self.dump, obj)
         self.assertEqual([e for e in res["errors"] if "uuid" in e], [])
+
+
+class FakeFuseBar(object):
+    IDLE = 4 << 16
+
+    def __init__(self, pmc=0x10000001, idle=True, re_idle=True,
+                 debug=0, latch_ok=True):
+        self.pmc = pmc
+        self.idle = idle
+        self.re_idle = re_idle
+        self.debug = debug
+        self.latch_ok = latch_ok
+        self.addr = 77
+        self.data = 0
+        self.cmds = 0
+
+    def rd(self, off):
+        if off == ffmacro.PMC_BOOT_0:
+            return self.pmc
+        if off == ffmacro.FUSECTRL:
+            return FakeFuseBar.IDLE if self.idle else 0xe0050000
+        if off == ffmacro.FUSEADDR:
+            return self.addr
+        if off == ffmacro.FUSEDATA:
+            return self.data
+        if off == ffmacro.FUSEDEBUG:
+            return self.debug
+        return 0
+
+    def wr(self, off, val):
+        if off == ffmacro.FUSEADDR:
+            self.addr = val if self.latch_ok else val + 1
+        elif off == ffmacro.FUSECTRL and val == ffmacro.CMD_READ:
+            self.cmds += 1
+            self.idle = self.re_idle
+            self.data = self.addr * 3 % 0x100000000
+
+
+class TestFfMacro(unittest.TestCase):
+    def test_full_read_restores_address(self):
+        bar = FakeFuseBar()
+        rows = ffmacro.capture_rows(bar.rd, bar.wr)
+        self.assertEqual(len(rows), 512)
+        self.assertEqual(rows[100], 300)
+        self.assertEqual(bar.addr, 77)
+        self.assertEqual(bar.cmds, 512)
+
+    def test_partial_rows_survive_error(self):
+        bar = FakeFuseBar(re_idle=False)
+        clock_times = iter([0.0] * 4 + [0.5] * 100)
+        out = {}
+        with self.assertRaises(ffmacro.FuseControllerError):
+            ffmacro.capture_rows(bar.rd, bar.wr, sleep=lambda s: None,
+                                 clock=lambda: next(clock_times),
+                                 rows=out)
+        self.assertEqual(out, {})
+        self.assertEqual(bar.addr, 77)  # FUSEADDR restored on failure
+
+    def test_busy_controller_refuses_to_start(self):
+        bar = FakeFuseBar(idle=False)
+        with self.assertRaises(ffmacro.FuseControllerError) as cm:
+            ffmacro.capture_rows(bar.rd, bar.wr)
+        self.assertIn("busy", str(cm.exception))
+        self.assertEqual(bar.cmds, 0)
+
+    def test_debug_register_and_sentinel_and_latch(self):
+        with self.assertRaises(ffmacro.FuseControllerError):
+            ffmacro.capture_rows(FakeFuseBar(debug=1).rd, FakeFuseBar().wr)
+        with self.assertRaises(ffmacro.FuseControllerError):
+            ffmacro.capture_rows(FakeFuseBar(pmc=0).rd,
+                                 FakeFuseBar().wr)
+        bar = FakeFuseBar(latch_ok=False)
+        with self.assertRaises(ffmacro.FuseControllerError) as cm:
+            ffmacro.capture_rows(bar.rd, bar.wr)
+        self.assertIn("latch", str(cm.exception))
+
+    def test_generated_probe_c_carries_protocol(self):
+        src = ffmacro.probe_c_source()
+        self.assertNotIn("@", src)
+        for needle in ("ffprobe_read_rows", "ffprobe_idle",
+                       "writel(1, h + 8519680)",  # CMD_READ -> FUSECTRL
+                       "h + 8519684",             # FUSEADDR
+                       "h + 8519688"):            # FUSEDATA
+            self.assertIn(needle, src)
 
 
 ALLLOG = os.path.join(os.path.dirname(__file__), "..",
@@ -165,35 +351,90 @@ class TestIngest(unittest.TestCase):
         d = {"uuid": None, "fingerprint": "deadbeef00000000"}
         self.assertEqual(ingest.card_id(d), "fp-deadbeef00000000")
 
-    def test_scan_cli(self):
+    def _ffrow_lines(self):
+        return ["[ 1569.9] FFPROBE ffrow.%d 08200008 %08x"
+                % (r, 0x0fe805c1 if r == 222 else 0) for r in range(512)]
+
+    def test_cmd_read_log_fills_ff_rows(self):
+        m = ingest.load_map()
+        entries = ingest.parse_log("\n".join(self._ffrow_lines()))
+        dump = ingest.build_dump(m, entries)
+        self.assertEqual(ffrows.coverage(dump)[0], "complete")
+        self.assertEqual(dump["ff_rows"][222], 0x0fe805c1)
+        self.assertFalse(dump["read_only"])
+
+    def test_scan_with_cmd_read_log_yields_plans(self):
         out = tempfile.mkdtemp(prefix="ffcalc-out-")
         self.addCleanup(shutil.rmtree, out, True)
-        rc = cli.main(["scan", "--dir", self._collect_dir(),
-                       "--outdir", os.path.join(out, "cards"),
-                       "--plans", os.path.join(out, "plans")])
-        self.assertEqual(rc, 0)
+        d = self._collect_dir()
+        for _bdf, _uuid in UUIDS.values():
+            path = os.path.join(
+                d, "probe_%s.txt" % ingest.sanitize(_bdf))
+            with open(path, "a") as f:
+                f.write("\n" + "\n".join(self._ffrow_lines()))
+        self.assertEqual(
+            cli.main(["scan", "--dir", d,
+                      "--outdir", os.path.join(out, "cards"),
+                      "--plans", os.path.join(out, "plans")]), 0)
         for _bdf, uuid in UUIDS.values():
-            cid = uuid[4:]
-            self.assertTrue(os.path.exists(
-                os.path.join(out, "cards", cid + ".json")))
             with open(os.path.join(out, "plans",
-                                   cid + ".burn.json")) as f:
+                                   uuid[4:] + ".burn.json")) as f:
+                obj = json.load(f)
+            self.assertEqual(obj["uuid"], uuid)
+            # row 222 is occupied by the captured record
+            self.assertTrue(all(r["row"] >= 223 for r in obj["burn"]))
+
+    def _scan(self, out):
+        return cli.main(["scan", "--dir", self._collect_dir(),
+                         "--outdir", os.path.join(out, "cards"),
+                         "--plans", os.path.join(out, "plans")])
+
+    def _merge_rows(self, out):
+        rows = write_rows_file(load_dump(SAMPLE),
+                               os.path.join(out, "rows.txt"))
+        for _bdf, uuid in UUIDS.values():
+            rc = cli.main(["mergeff",
+                           os.path.join(out, "cards", uuid[4:] + ".json"),
+                           rows])
+            self.assertEqual(rc, 0)
+        return rows
+
+    def test_scan_cli_refuses_plans_without_ff_rows_then_ok(self):
+        out = tempfile.mkdtemp(prefix="ffcalc-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        # read-only probe cannot see FF rows -> dumps saved, plans refused
+        self.assertEqual(self._scan(out), 1)
+        plans = os.path.join(out, "plans")
+        self.assertFalse(os.path.isdir(plans))
+        for _bdf, uuid in UUIDS.values():
+            self.assertTrue(os.path.exists(
+                os.path.join(out, "cards", uuid[4:] + ".json")))
+        # after merging a full FF readout, a rescan yields the plans
+        self._merge_rows(out)
+        self.assertEqual(self._scan(out), 0)
+        for _bdf, uuid in UUIDS.values():
+            with open(os.path.join(plans, uuid[4:] + ".burn.json")) as f:
                 self.assertEqual(json.load(f)["uuid"], uuid)
 
     def test_verify_cli_ok_and_mismatch(self):
         out = tempfile.mkdtemp(prefix="ffcalc-out-")
         self.addCleanup(shutil.rmtree, out, True)
-        cli.main(["scan", "--dir", self._collect_dir(),
-                  "--outdir", os.path.join(out, "cards"),
-                  "--plans", os.path.join(out, "plans")])
+        self._scan(out)
+        rows = self._merge_rows(out)
+        self._scan(out)
         plan5 = os.path.join(out, "plans",
                              UUIDS[0xfa000000][1][4:] + ".burn.json")
-        rc = cli.main(["verify", plan5, "--dir", self._collect_dir()])
+        rc = cli.main(["verify", plan5, "--dir", self._collect_dir(),
+                       "--ffrows", rows])
         self.assertEqual(rc, 0)
+        # fresh read without the FF rows file -> replay cannot be trusted
+        rc = cli.main(["verify", plan5, "--dir", self._collect_dir()])
+        self.assertEqual(rc, 1)
         wrong = {bar: (bdf, "GPU-" + "f" * 32)
                  for bar, (bdf, _u) in UUIDS.items()}
         rc = cli.main(["verify", plan5,
-                       "--dir", self._collect_dir(wrong)])
+                       "--dir", self._collect_dir(wrong),
+                       "--ffrows", rows])
         self.assertEqual(rc, 1)
 
 

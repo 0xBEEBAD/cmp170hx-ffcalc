@@ -1,4 +1,4 @@
-from . import ffrecord
+from . import ffrecord, ffrows
 from .analyze import free_ff_rows, replay_blocks, used_ff_rows
 from .optionmap import BY_KEY, FIELDS, FF_ROW_MAX, FF_ROW_MIN, decode_field
 
@@ -11,6 +11,14 @@ def simulate(dump, plan_obj):
         if p and d and p != d:
             errors.append("plan %s %s does not match card %s"
                           % (idfield, p, d))
+    state, missing = ffrows.coverage(dump)
+    if state != "complete":
+        errors.append(
+            "ff rows readout %s (%d of %d FF rows unknown): row occupancy "
+            "and old values cannot be verified -- how to fix: %s"
+            % (state, len(missing), ffrows.N_FF_ROWS, ffrows.GUIDANCE))
+        return {"table": [], "errors": errors, "warnings": warnings,
+                "pending": [], "ff_rows_used_after": None}
     base = {c: dict(b) for c, b in replay_blocks(dump).items()}
     after = {c: dict(b) for c, b in base.items()}
     used = set(used_ff_rows(dump))

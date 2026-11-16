@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Capture option words + raw FF rows from a live CMP 170HX, read-only.
+"""Capture option words (and optionally raw fuse rows) from a live CMP 170HX.
 
-Pure reads against BAR0 via /sys/.../resource0 (O_RDONLY, no writes at all).
-Address table is vendored at ffcalc/data/ga100-fuses.json.
+The word capture is strictly read-only: pure reads against BAR0 via
+/sys/.../resource0. Address table is vendored at
+ffcalc/data/ga100-fuses.json.
 
-Raw FF rows are read through the fuse macro's CMD_READ mechanism. That path
-requires WRITING the command register, so it is OFF by default in this tool;
-enable with --read-ff-rows only on an idle card.
+--read-ff-rows additionally captures all 512 physical rows through the
+fuse macro's CMD_READ mechanism (ffcalc/ffmacro.py, procedure from
+kate-land/ga100vfi). CMD_READ is a command WRITE (FUSEADDR + FUSECTRL),
+so run it on an idle card; it is skipped on a bare capture. If you read
+the rows with another setup instead, pass the file with --ffrows. Without
+FF records in the dump, ffcalc refuses to emit or verify a burn plan (see
+ffcalc mergeff).
 
 Run on the card's host as root:
-    python3 -m ffcalc.capture --bdf 0000:05:00.0 --sku 8gb -o dump.json
+    python3 -m ffcalc.capture --bdf 0000:05:00.0 --sku 8gb \
+        --read-ff-rows -o dump.json
 """
 import argparse
 import io
@@ -19,13 +25,12 @@ import os
 import struct
 import sys
 
+from . import ffmacro, ffrows
+
 BAR0_LEN = 0x1000000
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MAP = os.path.join(_HERE, "data", "ga100-fuses.json")
-
-FF_ROW_MIN = 222
-FF_ROW_MAX = 486
 
 
 def open_bar0(bdf=None):
@@ -48,7 +53,8 @@ def open_bar0(bdf=None):
         raise SystemExit("no device 0x20c2 found")
     path = os.path.join(base, cands[0], "resource0")
     # Same access pattern cmpunlocker uses against a live nvidia driver:
-    # fd opened O_RDWR (we never write), mapping ACCESS_WRITE, reads only.
+    # fd opened O_RDWR, mapping ACCESS_WRITE. Word capture reads only;
+    # --read-ff-rows writes just FUSEADDR/FUSECTRL (CMD_READ command).
     fd = os.open(path, os.O_SYNC | os.O_RDWR)
     try:
         length = os.path.getsize(path) or BAR0_LEN
@@ -63,14 +69,24 @@ def rd(mm, addr):
     return struct.unpack("<I", mm.read(4))[0]
 
 
+def wr(mm, addr, value):
+    mm.seek(int(addr, 0))
+    mm.write(struct.pack("<I", value & 0xffffffff))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bdf")
     ap.add_argument("--map", default=DEFAULT_MAP)
     ap.add_argument("--sku", default="8gb", choices=("8gb", "10gb"))
     ap.add_argument("-o", "--out", default="dump.json")
+    ap.add_argument("--ffrows", metavar="FILE",
+                    help="FF rows file read out elsewhere; merged into the "
+                         "dump (see also --read-ff-rows)")
     ap.add_argument("--read-ff-rows", action="store_true",
-                    help="write CMD_READ to fuse macro (NOT read-only)")
+                    help="capture all 512 physical rows via fuse macro "
+                         "CMD_READ (writes FUSEADDR/FUSECTRL; idle card "
+                         "only)")
     args = ap.parse_args()
 
     with io.open(args.map, encoding="utf-8") as f:
@@ -97,10 +113,33 @@ def main():
     for name, addr in m["info"].items():
         info[name] = "0x%x" % rd(mm, addr)
 
-    dump = {"sku": args.sku, "bdf": bdf, "ff_rows": {}, "option_words": words,
-            "info": info, "read_only": not args.read_ff_rows}
+    ff_rows = {}
+    if args.ffrows:
+        try:
+            rows = ffrows.parse_file(args.ffrows)
+        except ValueError as e:
+            raise SystemExit("bad FF rows file %s: %s" % (args.ffrows, e))
+        ff_rows.update((r, v) for r, v in rows.items())
+    wrote_rows = bool(args.read_ff_rows)
+    if args.read_ff_rows:
+        try:
+            ffmacro.capture_rows(lambda a: rd(mm, a),
+                                 lambda a, v: wr(mm, a, v), rows=ff_rows)
+        except ffmacro.FuseControllerError as e:
+            print("WARN: CMD_READ pass aborted: %s" % e)
+            print("WARN: keeping the %d row(s) read so far" % len(ff_rows))
+    dump = {"sku": args.sku, "bdf": bdf,
+            "ff_rows": dict(("%d" % r, "0x%08x" % v)
+                           for r, v in sorted(ff_rows.items())),
+            "option_words": words, "info": info,
+            "read_only": not wrote_rows}
     with io.open(args.out, "w", encoding="utf-8") as f:
         json.dump(dump, f, indent=2, sort_keys=True)
+    state, missing = ffrows.coverage(dump)
+    if state != "complete":
+        print("note: FF rows %s (%d of %d unknown); ffcalc will not emit a "
+              "burn plan until a full readout is merged (ffcalc mergeff)"
+              % (state, len(missing), ffrows.N_FF_ROWS))
     print("wrote %s (%s)" % (args.out, bdf))
 
 

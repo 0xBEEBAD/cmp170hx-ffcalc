@@ -56,8 +56,16 @@ def fingerprint(entries):
     return h.hexdigest()[:16]
 
 
+FFROW = re.compile(r"ffrow\.(\d+)$")
+
+
 def build_dump(m, entries, sku="8gb", bdf=None, uuid=None, source=None):
     raw = dict((name, val) for name, _addr, val in entries)
+    ff_rows = {}
+    for name, val in raw.items():
+        mm = FFROW.match(name)
+        if mm:
+            ff_rows[int(mm.group(1))] = val
     words = {}
     for key, loc in m["fields"].items():
         fused = raw.get(key + ".fused")
@@ -81,8 +89,9 @@ def build_dump(m, entries, sku="8gb", bdf=None, uuid=None, source=None):
         w = raw.get("info." + name)
         if w is not None:
             info[name] = w
-    dump = {"sku": sku, "ff_rows": {}, "option_words": words, "info": info,
-            "source": source or "ffprobe.ko", "read_only": True}
+    dump = {"sku": sku, "ff_rows": ff_rows, "option_words": words,
+            "info": info, "source": source or "ffprobe.ko",
+            "read_only": not ff_rows}
     if bdf:
         dump["bdf"] = bdf
     if uuid:

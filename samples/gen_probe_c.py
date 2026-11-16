@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Generate a tiny read-only kernel module (ffprobe.ko) from the vendored
-fuse register map. Build on the target, insmod once per GPU (bar0=<phys>),
-values land in dmesg, module auto-removes itself. No writes to the device.
+"""Generate the ffprobe.ko kernel module from the vendored fuse register map.
+Build on the target, insmod once per GPU (bar0=<phys>), values land in
+dmesg, module auto-removes itself. Option-word reads are pure MMIO; by
+default the module then captures all 512 physical fuse rows via fuse-macro
+CMD_READ (writes to FUSEADDR/FUSECTRL only; procedure from
+kate-land/ga100vfi, shared with ffcalc/ffmacro.py). Pass ffrows=0 at
+insmod time to skip the CMD_READ pass on a card that is not idle.
 
     python3 gen_probe_c.py > ffprobe.c
     make -C /lib/modules/$(uname -r)/build M=$PWD modules
@@ -11,28 +15,38 @@ values land in dmesg, module auto-removes itself. No writes to the device.
 import io
 import json
 import os
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAP = os.path.join(HERE, "..", "ffcalc", "data", "ga100-fuses.json")
+sys.path.insert(0, os.path.join(HERE, ".."))
+
+from ffcalc import ffmacro  # noqa: E402
 
 TPL = """\
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/io.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/types.h>
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("ffcalc read-only GA100 fuse-word probe");
+MODULE_DESCRIPTION("ffcalc GA100 fuse probe (words read-only + CMD_READ rows)");
 
 static u64 bar0;
 module_param(bar0, ullong, 0444);
 MODULE_PARM_DESC(bar0, "physical BAR0 base address of the GPU");
 
+static bool ffrows = true;
+module_param(ffrows, bool, 0444);
+MODULE_PARM_DESC(ffrows, "capture 512 raw rows via CMD_READ (default on)");
+
 struct probe_entry { u32 off; const char *name; };
 static const struct probe_entry entries[] = {
 @BODY@
 };
-
+@FFROWS@
 static int __init ffprobe_init(void)
 {
 	void __iomem *h;
@@ -47,6 +61,9 @@ static int __init ffprobe_init(void)
 		pr_info("FFPROBE %s %08llx %08x\\n", entries[i].name,
 			(u64)bar0 + entries[i].off,
 			readl(h + entries[i].off));
+	if (ffrows)
+		pr_info("FFPROBE ffrows_done 00000000 %08x\\n",
+			ffprobe_read_rows(h) ? 1 : 0);
 	iounmap(h);
 	return -EAGAIN;
 }
@@ -76,7 +93,9 @@ def main():
     entries += regs
     body = ['\t{ 0x%08x, "%s" },' % (off, name)
             for off, name in sorted(entries)]
-    print(TPL.replace("@BODY@", "\n".join(body)))
+    src = TPL.replace("@BODY@", "\n".join(body))
+    src = src.replace("@FFROWS@", ffmacro.probe_c_source())
+    print(src)
 
 
 if __name__ == "__main__":

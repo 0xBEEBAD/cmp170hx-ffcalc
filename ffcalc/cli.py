@@ -4,12 +4,35 @@ import json
 import os
 import sys
 
-from . import ingest
+from . import ffrows, ingest
 from .analyze import analyze
 from .dump import load_dump
 from .generate import plan
 from .optionmap import BY_KEY, FF_ROW_MAX, FF_ROW_MIN
 from .simulate import simulate
+
+
+def _apply_ffrows_option(dump, path):
+    """Merge an external FF rows file into a dump (shared by --ffrows)."""
+    try:
+        rows = ffrows.parse_file(path)
+    except ValueError as e:
+        raise SystemExit("bad FF rows file %s: %s" % (path, e))
+    return ffrows.merge_into(dump, rows)
+
+
+def _write_dump_ffrows(dump_path, rows):
+    """Update only ff_rows in a saved card JSON, preserving other fields."""
+    with io.open(dump_path, encoding="utf-8") as f:
+        raw = json.load(f)
+    merged = dict((int(k, 0), v) for k, v in (raw.get("ff_rows") or {}).items())
+    for row, value in sorted(rows.items()):
+        merged[row] = value
+    raw["ff_rows"] = dict(("%d" % r, "0x%08x" % v)
+                          for r, v in sorted(merged.items()))
+    with io.open(dump_path, "w", encoding="utf-8") as f:
+        json.dump(raw, f, indent=2, sort_keys=True)
+    return ffrows.coverage({"ff_rows": merged})
 
 
 def _parse_sets(pairs):
@@ -30,9 +53,14 @@ def _print_analysis(rep):
     if rep.get("uuid"):
         print("Card UUID: %s   fingerprint: %s"
               % (rep["uuid"], rep.get("fingerprint")))
-    print("SKU: %s   FF rows: %d used, %d free (rows %d-%d)"
-          % (rep["sku"], rep["ff_rows_used"], rep["ff_rows_free"],
-             FF_ROW_MIN, FF_ROW_MAX))
+    if rep.get("ff_rows_state") == "complete":
+        rows_desc = "%d used, %d free (rows %d-%d)" % (
+            rep["ff_rows_used"], rep["ff_rows_free"], FF_ROW_MIN, FF_ROW_MAX)
+    else:
+        rows_desc = ("NOT READ (%s) -- no burn plan until FF rows are "
+                     "captured and merged (ffcalc mergeff)"
+                     % rep.get("ff_rows_state"))
+    print("SKU: %s   FF rows: %s" % (rep["sku"], rows_desc))
     if rep["usable_fbp"] is not None:
         print("\n[Framebuffer potential]")
         print("  fbp_disable  current=0x%x  target=0x%x"
@@ -65,16 +93,27 @@ def main(argv=None):
     p.add_argument("--set", action="append", metavar="KEY=HEX",
                    help="override a target option value")
 
-    p = sub.add_parser("gen", help="generate FF burn records from a dump")
+    p = sub.add_parser("gen", help="generate FF burn records from a dump "
+                       "(refuses if current FF records were not read)")
     p.add_argument("dump")
     p.add_argument("-o", "--out", required=True)
     p.add_argument("--set", action="append", metavar="KEY=HEX")
     p.add_argument("--only", help="comma-separated keys to consider")
     p.add_argument("--skip", help="comma-separated keys to ignore")
+    p.add_argument("--ffrows", metavar="FILE",
+                   help="FF rows file to merge before planning "
+                        "(see ffcalc mergeff)")
+
+    p = sub.add_parser("mergeff", help="merge an externally-read FF rows "
+                       "dump (e.g. fuse macro CMD_READ) into a card dump")
+    p.add_argument("dump", help="card dump json to update in place")
+    p.add_argument("rows", help="FF rows file: one '<row> <value>' per line")
 
     p = sub.add_parser("sim", help="replay dump + burn plan and verify")
     p.add_argument("dump")
     p.add_argument("burn")
+    p.add_argument("--ffrows", metavar="FILE",
+                   help="FF rows file to merge before replaying")
 
     p = sub.add_parser("scan", help="analyze every card in a collected dir; "
                        "print table, save UUID-keyed dumps and burn plans")
@@ -90,6 +129,9 @@ def main(argv=None):
     p.add_argument("burn")
     p.add_argument("--dir", help="fresh collected dir")
     p.add_argument("--dump", help="fresh single-card dump json")
+    p.add_argument("--ffrows", metavar="FILE",
+                   help="FF rows file to merge into the fresh read before "
+                        "replaying the plan")
 
     args = ap.parse_args(argv)
 
@@ -98,11 +140,40 @@ def main(argv=None):
         _print_analysis(analyze(dump, _parse_sets(args.set)))
         return 0
 
+    if args.cmd == "mergeff":
+        try:
+            rows = ffrows.parse_file(args.rows)
+        except ValueError as e:
+            print("FAIL: bad FF rows file %s: %s" % (args.rows, e))
+            return 2
+        state, missing = _write_dump_ffrows(args.dump, rows)
+        print("merged %d FF row(s) into %s" % (len(rows), args.dump))
+        if state == "complete":
+            print("FF rows %d-%d fully covered; burn plan available: "
+                  "ffcalc gen %s -o plans/<uuid>.burn.json"
+                  % (FF_ROW_MIN, FF_ROW_MAX, args.dump))
+            return 0
+        print("STILL %s: %d of %d FF rows unknown (rows %d-%d; e.g. %s)"
+              % (state, len(missing), ffrows.N_FF_ROWS, FF_ROW_MIN,
+                 FF_ROW_MAX, ffrows.fmt_rows(missing)))
+        print("unburnt rows must be listed as 0; how to fix: %s"
+              % ffrows.GUIDANCE)
+        return 1
+
     if args.cmd == "gen":
         dump = load_dump(args.dump)
+        if args.ffrows:
+            _apply_ffrows_option(dump, args.ffrows)
         only = args.only.split(",") if args.only else None
         skip = args.skip.split(",") if args.skip else []
-        obj = plan(dump, only=only, skip=skip, overrides=_parse_sets(args.set))
+        try:
+            obj = plan(dump, only=only, skip=skip,
+                       overrides=_parse_sets(args.set))
+        except ffrows.FFRowsNotRead as e:
+            print("REFUSED: %s" % e.detail)
+            print("how to fix: %s" % ffrows.GUIDANCE)
+            print("no burn plan was written to %s" % args.out)
+            return 2
         with io.open(args.out, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2, sort_keys=True)
         print("card: %s  fingerprint: %s"
@@ -121,6 +192,8 @@ def main(argv=None):
 
     if args.cmd == "sim":
         dump = load_dump(args.dump)
+        if args.ffrows:
+            _apply_ffrows_option(dump, args.ffrows)
         with io.open(args.burn, encoding="utf-8") as f:
             burn_obj = json.load(f)
         res = simulate(dump, burn_obj)
@@ -147,19 +220,33 @@ def main(argv=None):
     if args.cmd == "scan":
         m = ingest.load_map()
         rows = []
+        no_ffrows = []
         for dump in ingest.read_collected(args.dir, m, sku=args.sku):
+            saved = os.path.join(args.outdir,
+                                 ingest.card_id(dump) + ".json")
+            if not dump["ff_rows"] and os.path.exists(saved):
+                try:
+                    prev = load_dump(saved)
+                except ValueError:
+                    prev = None
+                if prev and prev.get("ff_rows"):
+                    dump["ff_rows"] = prev["ff_rows"]
             rep = analyze(dump)
             dpath = ingest.save_dump(args.outdir, dump)
-            pinfo = "-"
+            pinfo = "-" if args.no_gen else "SKIPPED (FF rows not read)"
             if not args.no_gen:
-                obj = plan(dump)
-                if not os.path.isdir(args.plans):
-                    os.makedirs(args.plans)
-                ppath = os.path.join(args.plans,
-                                     ingest.card_id(dump) + ".burn.json")
-                with io.open(ppath, "w", encoding="utf-8") as f:
-                    json.dump(obj, f, indent=2, sort_keys=True)
-                pinfo = "%s (%d records)" % (ppath, len(obj["burn"]))
+                try:
+                    obj = plan(dump)
+                except ffrows.FFRowsNotRead:
+                    no_ffrows.append(dpath)
+                else:
+                    if not os.path.isdir(args.plans):
+                        os.makedirs(args.plans)
+                    ppath = os.path.join(args.plans,
+                                         ingest.card_id(dump) + ".burn.json")
+                    with io.open(ppath, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, indent=2, sort_keys=True)
+                    pinfo = "%s (%d records)" % (ppath, len(obj["burn"]))
             rows.append((dump, rep, pinfo))
         if not rows:
             print("no cards found under %s/bar0map.tsv" % args.dir)
@@ -178,6 +265,15 @@ def main(argv=None):
             for wmsg in rep["warnings"]:
                 print("WARN %s: %s" % (dump.get("uuid") or
                                        dump.get("fingerprint"), wmsg))
+        if no_ffrows:
+            print("\nNO BURN PLAN for %d card(s): their current FF records "
+                  "were never read (read-only probe cannot see FF rows; "
+                  "burning blind could reuse occupied rows)."
+                  % len(no_ffrows))
+            for dpath in no_ffrows:
+                print("  %s: ffcalc mergeff %s <ffrows.txt>" % (dpath, dpath))
+            print("how to fix: %s" % ffrows.GUIDANCE)
+            return 1
         return 0
 
     if args.cmd == "verify":
@@ -194,6 +290,9 @@ def main(argv=None):
         else:
             print("FAIL: verify needs --dir <collected> or --dump <json>")
             return 2
+        if args.ffrows:
+            for d in dumps:
+                _apply_ffrows_option(d, args.ffrows)
         match = None
         for d in dumps:
             if (puuid and d.get("uuid") == puuid) or \
