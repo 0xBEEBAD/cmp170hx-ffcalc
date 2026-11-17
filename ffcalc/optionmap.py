@@ -21,6 +21,7 @@ class OptionField:
     defect_key: str = ""
     note: str = ""
     burnable: bool = True
+    opt_in: bool = False
 
 
 def _tpc_fields():
@@ -71,7 +72,17 @@ FIELDS = [
                 2, 49 * 16 + 6, 1, "pcie", ""),
     OptionField("pcie_boot_gen3_dis", "NV_FUSE_OPT_PCIE_BOOT_GEN3_DISABLE",
                 2, 49 * 16 + 7, 1, "pcie", ""),
+    # Whole MAGIC_BITS_D register (BAR0 0x820520). Chain-2 mapping confirmed
+    # on three CMP 170HX cards: MAGIC = (block47<<22)|(block46<<6), matching
+    # the upstream bit25=block47.3 anchor. opt_in: never a default target.
+    # The A100 value below is an UNTESTED community guess (see --a100).
+    OptionField("magic_d", "NV_FUSE_OPT_PCIE_MAGIC_BITS_D",
+                2, 730, 32, "identity", "",
+                "whole MAGIC_BITS_D word; --a100 / --set magic_d=HEX",
+                opt_in=True),
 ]
+
+A100_MAGIC_D = 0x00200000
 
 BY_KEY = {f.key: f for f in FIELDS}
 

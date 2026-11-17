@@ -7,6 +7,8 @@
 # and a rerun. Exit code is nonzero while any card lacks FF rows.
 # Run from the repo root on the card host.
 #   sudo ./scripts/ffscan.sh [collect-dir]
+# Set A100=1 to have plans also rewrite MAGIC_BITS_D to 0x200000
+# (EXPERIMENTAL, community-sourced, untested on a real A100).
 set -e
 cd "$(dirname "$0")/.."
 DIR=${1:-collected}
@@ -39,4 +41,6 @@ for dev in /sys/bus/pci/devices/*; do
 	sudo dmesg | grep FFPROBE | tail -n "$N" > "$DIR/probe_${bdf//[:.]/_}.txt"
 	printf '%s\t%s\t%s\n' "$bdf" "$bar0" "$uuid" >> "$DIR/bar0map.tsv"
 done
-$PY -m ffcalc scan --dir "$DIR" --outdir cards --plans plans
+SCAN_FLAGS=""
+[ "${A100:-0}" = "1" ] && SCAN_FLAGS="--a100"
+$PY -m ffcalc scan --dir "$DIR" --outdir cards --plans plans $SCAN_FLAGS

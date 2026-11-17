@@ -103,6 +103,10 @@ def main(argv=None):
     p.add_argument("--ffrows", metavar="FILE",
                    help="FF rows file to merge before planning "
                         "(see ffcalc mergeff)")
+    p.add_argument("--a100", action="store_true",
+                   help="EXPERIMENTAL (community-sourced, untested on a "
+                        "real A100): also rewrite MAGIC_BITS_D to "
+                        "0x200000 for A100 vBIOS compatibility")
 
     p = sub.add_parser("mergeff", help="merge an externally-read FF rows "
                        "dump (e.g. fuse macro CMD_READ) into a card dump")
@@ -123,6 +127,9 @@ def main(argv=None):
     p.add_argument("--plans", default="plans")
     p.add_argument("--sku", default="8gb", choices=("8gb", "10gb"))
     p.add_argument("--no-gen", action="store_true")
+    p.add_argument("--a100", action="store_true",
+                   help="EXPERIMENTAL: plans also rewrite MAGIC_BITS_D to "
+                        "0x200000 (community-sourced, untested)")
 
     p = sub.add_parser("verify", help="check that a burn plan belongs to "
                        "the card currently in the machine")
@@ -168,7 +175,7 @@ def main(argv=None):
         skip = args.skip.split(",") if args.skip else []
         try:
             obj = plan(dump, only=only, skip=skip,
-                       overrides=_parse_sets(args.set))
+                       overrides=_parse_sets(args.set), a100=args.a100)
         except ffrows.FFRowsNotRead as e:
             print("REFUSED: %s" % e.detail)
             print("how to fix: %s" % ffrows.GUIDANCE)
@@ -236,7 +243,7 @@ def main(argv=None):
             pinfo = "-" if args.no_gen else "SKIPPED (FF rows not read)"
             if not args.no_gen:
                 try:
-                    obj = plan(dump)
+                    obj = plan(dump, a100=args.a100)
                 except ffrows.FFRowsNotRead:
                     no_ffrows.append(dpath)
                 else:

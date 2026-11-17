@@ -83,6 +83,8 @@ def simulate(dump, plan_obj):
                     pending.append(f.key)
 
     for f in FIELDS:
+        if f.opt_in:
+            continue
         if f.key in burned_keys or f.key in targets:
             continue
         if cur.get(f.key, 0) != new.get(f.key, 0):

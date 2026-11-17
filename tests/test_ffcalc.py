@@ -108,6 +108,36 @@ class TestDump(unittest.TestCase):
         res = simulate(dict(self.dump, ff_rows={}), obj)
         self.assertTrue(any("ff rows readout" in e for e in res["errors"]))
 
+    def test_a100_rewrites_magic_whole_word(self):
+        obj = plan(self.dump, a100=True)
+        b46 = [r for r in obj["burn"] if r["block"] == 46]
+        b47 = [r for r in obj["burn"] if r["block"] == 47]
+        self.assertEqual(len(b46), 1)
+        self.assertEqual(int(b46[0]["new"], 0), 0x8000)
+        self.assertIn("magic_d", b46[0]["fields"])
+        self.assertEqual(len(b47), 1)
+        self.assertEqual(int(b47[0]["new"], 0), 0)
+        self.assertIn("magic_d", b47[0]["fields"])
+        self.assertEqual(obj["targets"]["magic_d"], "0x200000")
+        self.assertTrue(any("EXPERIMENTAL" in w for w in obj["warnings"]))
+        res = simulate(self.dump, obj)
+        self.assertEqual(res["errors"], [])
+
+    def test_a100_noop_when_magic_already_a100(self):
+        rows = dict(self.dump["ff_rows"])
+        free = sorted(int(r, 0) if isinstance(r, str) else r
+                      for r, v in rows.items()
+                      if (v if isinstance(v, int) else int(v, 0)) == 0)
+        rows[free[0]] = ffrecord.encode(2, 46, 0x8000)
+        rows[free[1]] = ffrecord.encode(2, 47, 0x0000)
+        obj = plan(dict(self.dump, ff_rows=rows), a100=True)
+        self.assertFalse([r for r in obj["burn"] if r["block"] in (46, 47)])
+
+    def test_magic_not_touched_without_a100(self):
+        obj = plan(self.dump)
+        self.assertNotIn("magic_d", obj["targets"])
+        self.assertFalse([r for r in obj["burn"] if r["block"] == 46])
+
 
 class TestFfRowsParsing(unittest.TestCase):
     def test_formats(self):

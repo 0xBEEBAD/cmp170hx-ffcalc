@@ -1,17 +1,29 @@
 from . import ffrecord, ffrows
 from .analyze import analyze, replay_blocks, used_ff_rows
-from .optionmap import (FIELDS, FF_ROW_MAX, FF_ROW_MIN, blocks_touched,
-                        get_bits, set_bits)
+from .optionmap import (A100_MAGIC_D, FIELDS, FF_ROW_MAX, FF_ROW_MIN,
+                        blocks_touched, get_bits, set_bits)
 
 
-def plan(dump, only=None, skip=(), overrides=None):
+def plan(dump, only=None, skip=(), overrides=None, a100=False):
     # Without a complete FF-row snapshot we cannot know which rows are
     # occupied or what the current block values are; refuse rather than
     # append records onto already-burnt rows.
     ffrows.require(dump, "generate a burn plan")
+    if a100:
+        # EXPERIMENTAL, untested on a real A100: rewrite whole MAGIC_BITS_D
+        # to the community-guessed A100 value (vBIOS compatibility reports
+        # claim it is needed before flashing an A100 vBIOS).
+        overrides = dict(overrides or {})
+        overrides.setdefault("magic_d", A100_MAGIC_D)
     rep = analyze(dump, overrides)
     targets = rep["targets"]
     warnings = list(rep["warnings"])
+    if a100 or "magic_d" in targets:
+        warnings.append(
+            "magic_d -> 0x%x is an EXPERIMENTAL, untested rewrite compiled "
+            "from community reports (cross-check against a real A100 "
+            "MAGIC_BITS_D readout before burning)" % targets.get(
+                "magic_d", A100_MAGIC_D))
     words = dump["option_words"]
     only = set(only) if only else None
     skip = set(skip)

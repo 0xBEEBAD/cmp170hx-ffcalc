@@ -39,7 +39,7 @@ GPU-b6b9f653-ec1d-f20f-829c-243314997fa8 0000:06:00.0  64->64 GiB    124 98fa952
 |---|---|
 | `FB now->max` | 当前显存 → 硬件潜力。**`64->64` 说明这张卡白烧**（物理 FBP 缺陷封顶，如 defective 0x2d 那张），别烧 |
 | `SM` | 按 defective 底线能放出的 SM 数（A100 量产只开 108，CMP 常藏着 120+） |
-| `FP` | fingerprint：`*_DEFECTIVE` 全字 + SBFE 位的 sha256 前 16 位。物理缺陷不随烧写/重启变化，**烧前烧后必须一致**，是 nvidia-smi 不在场时（glitch 台架）的认卡手段；同批卡 defective 相同会碰撞，多卡场景仍以 UUID 为准 |
+| `FP` | fingerprint：`*_DEFECTIVE` 全字 + SBFE 位的 sha256 前 16 位。物理缺陷不随烧写/重启变化，**烧前烧后必须一致**，是 nvidia-smi 不在场时（glitch 台架）的认卡手段；同批卡 defective 相同、出厂 SBFE 即为 1，指纹可与烧后完全相同——认卡、对计划以 UUID 为准 |
 | `plan` | 该卡的烧写计划文件；显示 `SKIPPED (FF rows not read)` 表示 FF 行没读全，工具拒绝出计划（见「兜底路」） |
 
 ### 第 2 步 · 看计划、定范围
@@ -135,6 +135,8 @@ python3 -m ffcalc.burntool burn  plans/<uuid>.burn.json \
 | `burntool burn plan.json --dump dump.json --bdf … [--rows 315]` | 断言式烧写执行（见 docs/BURNING.md） |
 
 常用参数：`--set fbp_disable=0x840`（覆盖目标值）、`--only` / `--skip`（字段过滤，首次试烧建议 `--only fbp_disable`）。
+
+`--a100`（`gen` / `scan`，或 `A100=1 ./scripts/ffscan.sh`）额外把整字 `MAGIC_BITS_D` 改写成 `0x200000`（chain2 blk46→`0x8000`、blk47→`0x0000`），用于刷 A100 vBIOS。**这是实验性猜测：值来自社区网络汇总，尚未在真实 A100 上实测，烧前请对照真实 A100 的 MAGIC_BITS_D 读值自行核实**（计划里也会打印该警告）。已烧成该值则自动跳过、不产生记录。
 
 ## FF 记录格式（本工具严格遵循）
 

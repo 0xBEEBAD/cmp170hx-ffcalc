@@ -66,7 +66,7 @@ burntool 在每一步都检测锁死并以此消息中止（rc=3）。
 - `tpc_gpc3/6_disable` 在 **status 层**显示 `0x1`（fused 层 =0x0）：OEM 固件运行时自屏蔽，参考机上未烧卡的同字段行为相同，**属正常现象**，别再往这两个位上补烧。
 - 烧写使 SBFE=1 → fingerprint 变为 `3ab5093e8f9f78b5`（defective 基不变）。用**烧后指纹**认后续快照。
 - 重生成计划 = 0 条：潜力 80 GiB / 108 SM / NVLink / Gen4 全部就位；驱动层（geometry/Gen4）另行处理，与 FF 无关。
-- **指纹碰撞实测**：同批次未烧卡 `GPU-85b20be7…`（defective 相同、SBFE 出厂即 1）与烧后指纹 `3ab5093e…` 完全相同、计划同为 17 条。fingerprint 只能证明"同一缺陷分组的 die"，**多卡环境认卡必须用 UUID**；burntool 逐行对快照正是 UUID 之外的最后一道闸。
+- **指纹不是唯一身份证**：defective+SBFE 的哈希在同批次卡之间会相同（同批卡的出厂卡 SBFE 本来就是 1，其指纹与我们烧穿后重算的指纹一模一样——我们曾被这份烧前旧快照误导过一次）。fingerprint 只用来核对"烧前烧后同一块 die"，**认卡、对计划必须用 UUID**；burntool 逐行对快照是 UUID 之外的最后一道闸。
 
 ## 6. 踩坑速查（本流程实际踩过或已替你挡住）
 

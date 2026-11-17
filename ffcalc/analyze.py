@@ -35,6 +35,8 @@ def resolve_targets(dump, overrides=None):
     for f in FIELDS:
         if not f.burnable:
             continue
+        if f.opt_in and f.key not in overrides:
+            continue
         if f.key in overrides:
             targets[f.key] = overrides[f.key]
         elif f.defect_key and f.defect_key in words:
