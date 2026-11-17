@@ -2,7 +2,11 @@
 
 针对 [kate-land 的 GA100 VFI 研究](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)的离线辅助工具，纯 Python 标准库 + 一个只读内核探测模块，与 [cmpunlocker] 独立。
 
-> **警告**：FF 熔丝烧写是**物理不可逆**操作，错误目标值可能永久报废显存分区甚至整卡；本工具只做只读采集、分析与计划生成，**不执行烧写**。风险自负。
+> ## ⚠ 刷卡有风险
+>
+> FF 熔丝烧写**物理不可逆**，错误目标值最坏的后果是**整卡报废**——动手前请确认这个最坏后果是你能接受的。每个操作谨慎、谨慎、再谨慎；**数据一定要交叉核对，多找几个工具互相印证**（本工具的 `verify`/`sim`、外部读行工具、对照另一张已知好卡），任何一处对不上就停下来查，全部对上了再烧。
+>
+> 本仓库负责只读采集、分析、计划与核验；烧写执行用 `python -m ffcalc.burntool`（流程、断言与错误锁死后的恢复见 [docs/BURNING.md](docs/BURNING.md)，已实卡闭环）。风险自负。
 
 ## 依赖
 
@@ -10,7 +14,7 @@
 - 采集端（Linux 主机）：`gcc` / `make` / 与运行内核匹配的 `linux-headers`、`sudo`、已加载 nvidia 驱动的机器（`nvidia-smi` 用于读取 GPU UUID；没有时退化为 fingerprint 认卡）
 - 分析端：无要求，dump JSON 拷到哪都能跑
 
-## 使用流程：从拿到仓库到烧写（四步）
+## 使用流程：从拿到仓库到烧写（五步）
 
 ### 第 1 步 · 采集 + 出计划（一条命令）
 
@@ -21,7 +25,7 @@ git clone <repo> && cd ffcalc
 sudo bash scripts/ffscan.sh
 ```
 
-它构建探测模块 `ffprobe.ko`，对每张 CMP 170HX（device 0x20c2）只读 61 个熔丝寄存器，再自动跑 CMD_READ 读出全部 512 物理熔丝行（只写 FUSEADDR/FUSECTRL 命令寄存器；控制器非 IDLE 会中止并如实报 partial），然后用 `nvidia-smi` 关联 UUID、做潜力分析、按 UUID 落盘。结束时打印（实机输出示例）：
+它构建探测模块 `ffprobe.ko`，对每张 CMP 170HX（device 0x20c2）只读 61 个熔丝寄存器，再自动跑 CMD_READ 读出全部 512 物理熔丝行（只写 FUSEADDR/FUSECTRL 命令寄存器；控制器非 IDLE 会中止并如实报 partial），然后用 `nvidia-smi` 关联 UUID、做潜力分析、按 UUID 保存文件。结束时打印（实机输出示例）：
 
 ```
 card UUID                                BDF           FB now->max    SM  FP         plan
@@ -35,7 +39,7 @@ GPU-b6b9f653-ec1d-f20f-829c-243314997fa8 0000:06:00.0  64->64 GiB    124 98fa952
 |---|---|
 | `FB now->max` | 当前显存 → 硬件潜力。**`64->64` 说明这张卡白烧**（物理 FBP 缺陷封顶，如 defective 0x2d 那张），别烧 |
 | `SM` | 按 defective 底线能放出的 SM 数（A100 量产只开 108，CMP 常藏着 120+） |
-| `FP` | fingerprint：`*_DEFECTIVE` 全字 + SBFE 位的 sha256 前 16 位。物理缺陷不随烧写/重启变化，**烧前烧后必须一致**，是 nvidia-smi 不在场时（glitch 台架）的认卡手段 |
+| `FP` | fingerprint：`*_DEFECTIVE` 全字 + SBFE 位的 sha256 前 16 位。物理缺陷不随烧写/重启变化，**烧前烧后必须一致**，是 nvidia-smi 不在场时（glitch 台架）的认卡手段；同批卡 defective 相同会碰撞，多卡场景仍以 UUID 为准 |
 | `plan` | 该卡的烧写计划文件；显示 `SKIPPED (FF rows not read)` 表示 FF 行没读全，工具拒绝出计划（见「兜底路」） |
 
 ### 第 2 步 · 看计划、定范围
@@ -57,7 +61,7 @@ GPU-b6b9f653-ec1d-f20f-829c-243314997fa8 0000:06:00.0  64->64 GiB    124 98fa952
 
 文件其余顶层字段：`uuid`/`fingerprint`（这张计划的身份，verify 用它对卡）、`targets`（各 option word 目标值）、`analysis`（烧完可达到的 FB/SM 潜力）、`warnings`（如「目标值没包住 defective 底线」）。
 
-想改范围就用 `gen` 重新生成：`python -m ffcalc gen cards/<uuid>.json -o plans/try1.json --only fbp_disable`（首次试烧强烈建议只烧 fbp 一条，冷启动后读 `CRC_STATUS==0x55` 验证 CRC 自动重算，再上全量）。`--set fbp_disable=0x840` 可手工钉目标值。
+想改范围就用 `gen` 重新生成：`python -m ffcalc gen cards/<uuid>.json -o plans/try1.json --only fbp_disable`（首次试烧强烈建议只烧 fbp 一条，用第 4 步的 `--rows` 单行模式；冷启动后读 `CRC_STATUS==0x55` 已实测成立——控制器自动重算 CRC）。`--set fbp_disable=0x840` 可手工钉目标值。
 
 `cards/<uuid>.json` 是该卡完整快照（计划由它推出，重跑会自动继承）：
 
@@ -80,9 +84,21 @@ python -m ffcalc verify plans/<uuid>.burn.json --dir collected
 
 它现场重新采集一遍，然后拒掉四种情况：① 机器里没有这张 UUID 的卡（拿错卡/插错槽）；② UUID 对但 fingerprint 不对（不是同一块 die）；③ 现场 FF 行读不全（无法核对行占用与 old 值）；④ 回放不通过（计划要写的行已被占、或 old 对不上、或烧完到不了目标值）。输出 `OK: plan … belongs to card …` + rc=0 才放行。
 
-### 第 4 步 · 冷启动 → 闭环
+### 第 4 步 · 烧写执行（卡必须在烧写窗口内，见 docs/BURNING.md）
 
-断电重启（FF 只在开机沿重新解析）→ 重跑 `sudo bash scripts/ffscan.sh`：fingerprint 必须不变；潜力表 `FB now->max`/plan 应反映烧后状态（已烧字段消失，剩余记录行号后移）。要加烧就以这轮新计划为准重复第 2–4 步。**每次烧写后 FF 已变，旧计划作废。**
+```sh
+python3 -m ffcalc.burntool status --bdf 0000:05:00.0          # 检查写窗口条件
+python3 -m ffcalc.burntool burn  plans/<uuid>.burn.json \
+    --dump cards/<uuid>.json --bdf 0000:05:00.0 --rows 315    # 先试烧一行
+python3 -m ffcalc.burntool burn  plans/<uuid>.burn.json \
+    --dump cards/<uuid>.json --bdf 0000:05:00.0                # 再上全量
+```
+
+它按顺序强制：simulate 离线核验（0 错误）→ 窗口判据 → `CMD_SENSE` 后 DSOV 仍为 0 → 计划涉及的每一行现场回读必须与快照一致 → `arm`（SBFE 影子位 + WDATA_WR_SECURE，七项断言）→ 逐条 PROGRAM（目标行必须空白、锁行校验、回读必须等于记录值；上次中断已烧成的行自动跳过，重跑安全）。控制器命令失败后锁死（`FUSECTRL` 读 `0xBADFxxxx`）或任何控制器异常立即中止（rc=3）：停止一切读，整机断电后重新走第 1 步。首次使用务必先 `--rows` 试烧单条。
+
+### 第 5 步 · 冷启动 → 闭环
+
+断电重启（FF 只在开机沿重新解析）→ 重跑 `sudo bash scripts/ffscan.sh`：defective 指纹必须不变（SBFE 位会因烧写翻成 1，指纹随之前移属预期）；潜力表 `FB now->max`/plan 应反映烧后状态（已烧字段消失，剩余记录行号后移）。要加烧就以这轮新计划为准重复第 2–5 步。**每次烧写后 FF 已变，旧计划作废。**
 
 ## 兜底路（读不到 FF 行时）
 
@@ -101,6 +117,8 @@ python -m ffcalc verify plans/<uuid>.burn.json --dir collected
 | `STILL partial: N of 265 FF rows unknown`（mergeff） | 1 | 行文件没列全（多半是没把未烧行写 0），补全再 merge |
 | verify `FAIL: … not present / fingerprint differs / ff rows readout …` | 1 | 换卡重采 / 排查是否烧过 defective / 先补 FF 行 |
 | verify `OK: plan … belongs to card …` | 0 | 可以烧 |
+| burntool `REFUSED: …` | 1 | 计划/快照/窗口任一条件不满足，**卡未被写入**；按消息处置后重跑 |
+| burntool `ABORT: …`（poison / 超时 / 未授权） | 3 | 停止一切 BAR0 读 → 整机断电 → 重新进窗口先 `CMD_SENSE`（docs/BURNING.md §4）；断点续烧安全：已是目标值的行会被跳过 |
 | `insmod: … Resource temporarily unavailable` | — | 正常：探测模块打印完 `return -EAGAIN` 自卸载 |
 
 ## 子命令
@@ -113,6 +131,8 @@ python -m ffcalc verify plans/<uuid>.burn.json --dir collected
 | `report dump.json` | 单卡潜力分析 |
 | `gen dump.json -o plan.json [--ffrows ffrows.txt]` | 生成 FF 烧写记录（自动 16-bit 块合并）；FF 记录未读时拒绝出计划（退出码 2，不写文件） |
 | `sim dump.json plan.json [--ffrows ffrows.txt]` | 逐字段回放核对 |
+| `burntool status --bdf …` | 烧写窗口判据（只读） |
+| `burntool burn plan.json --dump dump.json --bdf … [--rows 315]` | 断言式烧写执行（见 docs/BURNING.md） |
 
 常用参数：`--set fbp_disable=0x840`（覆盖目标值）、`--only` / `--skip`（字段过滤，首次试烧建议 `--only fbp_disable`）。
 
@@ -134,9 +154,9 @@ FFPROBE <字段名> <寄存器物理地址> <32bit值>      # 熔丝行行名形
 ## 已确认 / 待验证
 
 - 三张实卡数据：两张 80 GiB 潜力（10 FBP），一张 64 GiB 封顶（很郁闷。。）（defective 0x2d）；defective 底线全部读到，option word 映射与博客数据一致
-- `DISABLE_GEN3_SPEED` 是 block39 的 bit1 还是 bit9 未定（上游未解决），默认两个都清
-- FF 链 CRC 是否由控制器在烧写时自动重算未验证——先 `--only fbp_disable` 烧一行，冷启动后读 `CRC_STATUS==0x55`，通过再烧全量
-- MIG / ECC / NVDEC 解锁（`sys_pipe_disable`）作者标注 untested
+- **实卡烧写闭环**（一张 CMP 170HX，17 条记录，行 304–320）：`CMD_PROGRAM=2` 确认（瞬时态 `0xE00C0000`）、空白行读 0、CRC 由控制器自动重算（烧后仍 0x55）、冷启动 BOOT0=0x170000a1、潜力全部落地；`tpc_gpc3/6` status 层 0x1 为固件运行时自屏蔽（fused 层 0x0，参考卡同样如此）。全过程与踩坑见 docs/BURNING.md
+- `DISABLE_GEN3_SPEED` 是 block39 的 bit1 还是 bit9 未定（上游未解决），默认两个都清——实卡两条都清 + MAGIC_D 未动，Gen4 训练通过（bit1 非必要嫌疑上升）
+- MIG / ECC / NVDEC 解锁（`sys_pipe_disable`）作者标注 untested；本卡已烧 0，功能验证待做
 - 10GB SKU 每 FBP 折算容量按 4 GiB 估
 - raw FF 行读出已内置：`ffprobe.ko` 默认跑 CMD_READ pass（`ffcalc/ffmacro.py` 单源生成 C，协议与 ga100vfi 一致：先查 FUSECTRL IDLE/FUSEDEBUG，锁行校验回读，发 CMD_READ，轮询回 IDLE，读 FUSEDATA，结束恢复 FUSEADDR）；`capture.py --read-ff-rows` 同流程。控制器忙 → 中止并保留已读行，工具按“读取不完整”拒绝出计划；外部读出的行仍可走 `mergeff`/`--ffrows` 导入
 
@@ -146,7 +166,8 @@ FFPROBE <字段名> <寄存器物理地址> <32bit值>      # 熔丝行行名形
 ffcalc/optionmap.py    option word ↔ FF chain/bit 映射（照抄博客数据表）
 ffcalc/ffrecord.py    FF 32-bit 记录编解码 + 链回放
 ffcalc/ffrows.py      FF 行快照完整性判定 + 外部行文件解析/合并
-ffcalc/ffmacro.py     fuse macro CMD_READ 读行协议（Python 用 + 生成内核 C 同源）
+ffcalc/ffmacro.py     fuse macro CMD_READ 读行协议（Python 用 + 生成内核 C 同源）+ 烧写指令组（sense/arm/program_row，实机确认）
+ffcalc/burntool.py     断言式烧写执行 CLI（离线核验→窗口→SENSE→对快照→arm→逐条 PROGRAM）
 ffcalc/analyze.py      潜力分析（FB/SM/NVLink/PCIe）
 ffcalc/generate.py     烧写计划生成（16-bit 块合并、行分配）
 ffcalc/simulate.py     计划回放核对
@@ -155,6 +176,7 @@ ffcalc/capture.py      备用采集（sysfs BAR0 mmap，适用于内核允许映
 ffcalc/data/ga100-fuses.json   寄存器地址表（社区逆向，vendored）
 samples/gen_probe_c.py         从地址表生成 ffprobe.c（words 只读 + CMD_READ 读行）
 scripts/ffscan.sh              一键采集+分析
+docs/BURNING.md                烧写操作规程 + 实卡验证记录（寄存器/断言/错误锁死恢复）
 tests/                       unittest，无外部依赖
 ```
 
