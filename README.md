@@ -1,10 +1,12 @@
 # ffcalc — GA100 CMP 170HX 熔丝解锁预计算工具
 
-针对 [kate-land 的 GA100 VFI 研究](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)的离线辅助工具，纯 Python 标准库 + 一个只读内核探测模块，与 [cmpunlocker] 独立。
+针对 [kate-land 的 GA100 VFI 研究](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/)的离线辅助工具，纯 Python 标准库 + 一个只读内核探测模块 + 刷写计划 + 可选刷写，与 [cmpunlocker] 独立。
 
 > ## ⚠ 刷卡有风险
 >
 > FF 熔丝烧写**物理不可逆**，错误目标值最坏的后果是**整卡报废**——动手前请确认这个最坏后果是你能接受的。每个操作谨慎、谨慎、再谨慎；**数据一定要交叉核对，多找几个工具互相印证**（本工具的 `verify`/`sim`、外部读行工具、对照另一张已知好卡），任何一处对不上就停下来查，全部对上了再烧。
+>
+> 最好用ai直接来读取分析执行本项目，省心省力，但是要对ai的行为进行约束！
 >
 > 本仓库负责只读采集、分析、计划与核验；烧写执行用 `python -m ffcalc.burntool`（流程、断言与错误锁死后的恢复见 [docs/BURNING.md](docs/BURNING.md)，已实卡闭环）。风险自负。
 
@@ -12,9 +14,27 @@
 
 - Python ≥ 3.6（仅标准库，分析端可完全离线运行）
 - 采集端（Linux 主机）：`gcc` / `make` / 与运行内核匹配的 `linux-headers`、`sudo`、已加载 nvidia 驱动的机器（`nvidia-smi` 用于读取 GPU UUID；没有时退化为 fingerprint 认卡）
-- 分析端：无要求，dump JSON 拷到哪都能跑
 
-## 使用流程：从拿到仓库到烧写（五步）
+## 子命令
+
+| 命令                                                         | 作用                                                         |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| `scan --dir collected [--outdir cards --plans plans]`        | 全表潜力分析 + 按 UUID 保存 dump 与计划；FF 行未知时跳过计划（退出码 1） |
+| `mergeff dump.json ffrows.txt`                               | 把外部读出的 FF 行合并进卡 dump，并报告覆盖是否完整          |
+| `verify <plan> --dir collected [--ffrows ffrows.txt] \| --dump dump.json` | UUID/fingerprint/回放 核验                                   |
+| `report dump.json`                                           | 单卡潜力分析                                                 |
+| `gen dump.json -o plan.json [--ffrows ffrows.txt]`           | 生成 FF 烧写记录（自动 16-bit 块合并）；FF 记录未读时拒绝出计划（退出码 2，不写文件） |
+| `sim dump.json plan.json [--ffrows ffrows.txt]`              | 逐字段回放核对                                               |
+| `burntool status --bdf …`                                    | 烧写窗口判据（只读）                                         |
+| `burntool burn plan.json --dump dump.json --bdf … [--rows 315]` | 断言式烧写执行（见 docs/BURNING.md）                         |
+
+常用参数：`--set fbp_disable=0x840`（覆盖目标值）、`--only` / `--skip`（字段过滤，首次试烧建议 `--only fbp_disable`）。
+
+`--a100`（`gen` / `scan` / `scripts/ffscan.sh`，或环境变量 `A100=1`）：见「第 1 步」说明。
+
+
+
+## 使用流程：
 
 ### 第 1 步 · 采集 + 出计划（一条命令）
 
@@ -22,8 +42,11 @@
 
 ```sh
 git clone <repo> && cd ffcalc
-sudo bash scripts/ffscan.sh
+sudo bash scripts/ffscan.sh            # 常规计划：只含 fbp/tpc/pcie 等潜力解锁记录
+sudo bash scripts/ffscan.sh --a100     # 同上，另把 MAGIC_BITS_D 改写记录也加进计划
 ```
+
+`--a100` 的意思是：每条计划额外追加把整字 `MAGIC_BITS_D` 改写成 `0x00200000` 的记录（chain2 blk46→`0x8000`、blk47→`0x0000`，已烧对则自动跳过）。部分 A100 vBIOS 启动时会校验这个熔丝字，不匹配会拒绝启动，所以打算刷 A100 vBIOS 的卡建议用这条命令一步出全计划。**注意：`0x00200000` 是实验性猜测值，来自社区网络信息汇总，尚未在真实 A100 上实测**——烧前请对照真实 A100 读出的 MAGIC_BITS_D 自行核实（计划和 gen 输出里也会打印这条警告）。
 
 它构建探测模块 `ffprobe.ko`，对每张 CMP 170HX（device 0x20c2）只读 61 个熔丝寄存器，再自动跑 CMD_READ 读出全部 512 物理熔丝行（只写 FUSEADDR/FUSECTRL 命令寄存器；控制器非 IDLE 会中止并如实报 partial），然后用 `nvidia-smi` 关联 UUID、做潜力分析、按 UUID 保存文件。结束时打印（实机输出示例）：
 
@@ -121,22 +144,7 @@ python3 -m ffcalc.burntool burn  plans/<uuid>.burn.json \
 | burntool `ABORT: …`（poison / 超时 / 未授权） | 3 | 停止一切 BAR0 读 → 整机断电 → 重新进窗口先 `CMD_SENSE`（docs/BURNING.md §4）；断点续烧安全：已是目标值的行会被跳过 |
 | `insmod: … Resource temporarily unavailable` | — | 正常：探测模块打印完 `return -EAGAIN` 自卸载 |
 
-## 子命令
 
-| 命令 | 作用 |
-|---|---|
-| `scan --dir collected [--outdir cards --plans plans]` | 全表潜力分析 + 按 UUID 保存 dump 与计划；FF 行未知时跳过计划（退出码 1） |
-| `mergeff dump.json ffrows.txt` | 把外部读出的 FF 行合并进卡 dump，并报告覆盖是否完整 |
-| `verify <plan> --dir collected [--ffrows ffrows.txt] \| --dump dump.json` | UUID/fingerprint/回放 核验 |
-| `report dump.json` | 单卡潜力分析 |
-| `gen dump.json -o plan.json [--ffrows ffrows.txt]` | 生成 FF 烧写记录（自动 16-bit 块合并）；FF 记录未读时拒绝出计划（退出码 2，不写文件） |
-| `sim dump.json plan.json [--ffrows ffrows.txt]` | 逐字段回放核对 |
-| `burntool status --bdf …` | 烧写窗口判据（只读） |
-| `burntool burn plan.json --dump dump.json --bdf … [--rows 315]` | 断言式烧写执行（见 docs/BURNING.md） |
-
-常用参数：`--set fbp_disable=0x840`（覆盖目标值）、`--only` / `--skip`（字段过滤，首次试烧建议 `--only fbp_disable`）。
-
-`--a100`（`gen` / `scan`，或 `A100=1 ./scripts/ffscan.sh`）额外把整字 `MAGIC_BITS_D` 改写成 `0x200000`（chain2 blk46→`0x8000`、blk47→`0x0000`），用于刷 A100 vBIOS。**这是实验性猜测：值来自社区网络汇总，尚未在真实 A100 上实测，烧前请对照真实 A100 的 MAGIC_BITS_D 读值自行核实**（计划里也会打印该警告）。已烧成该值则自动跳过、不产生记录。
 
 ## FF 记录格式（本工具严格遵循）
 
