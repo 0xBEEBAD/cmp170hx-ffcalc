@@ -1,10 +1,12 @@
+import functools
 import json
 import os
 import shutil
+import struct
 import tempfile
 import unittest
 
-from ffcalc import cli, ffmacro, ffrecord, ffrows, ingest
+from ffcalc import capture, cli, ffmacro, ffrecord, ffrows, ingest
 from ffcalc.analyze import analyze
 from ffcalc.dump import load_dump
 from ffcalc.generate import plan
@@ -322,6 +324,59 @@ class TestFfMacro(unittest.TestCase):
                        "h + 8519684",             # FUSEADDR
                        "h + 8519688"):            # FUSEDATA
             self.assertIn(needle, src)
+
+
+class FakeMmap(object):
+    """BAR0 word array with mmap's seek/read/write, enough to run one
+    CMD_READ: a command write to FUSECTRL completes at once and FUSEDATA
+    answers with f(FUSEADDR)."""
+
+    def __init__(self, words=()):
+        self.words = dict(words)
+        self.pos = 0
+
+    def seek(self, off):
+        self.pos = off
+
+    def read(self, n):
+        assert n == 4
+        return struct.pack("<I", self.words.get(self.pos, 0))
+
+    def write(self, buf):
+        assert len(buf) == 4
+        val = struct.unpack("<I", buf)[0]
+        if self.pos == ffmacro.FUSECTRL and val == ffmacro.CMD_READ:
+            self.words[ffmacro.FUSEDATA] = \
+                self.words.get(ffmacro.FUSEADDR, 0) * 3 % 0x100000000
+            val = ffmacro.IDLE_STATE << 16      # command done: back to IDLE
+        self.words[self.pos] = val
+
+
+class TestCaptureAccessors(unittest.TestCase):
+    """capture.rd/wr are the accessors used against a live card, so they have
+    to take both address styles: hex strings from the JSON map, and the plain
+    ints ffmacro passes for FUSECTRL/FUSEADDR/FUSEDATA."""
+
+    def test_offsets_accept_ints_and_strings(self):
+        mm = FakeMmap({ffmacro.FUSECTRL: 4 << 16})
+        self.assertEqual(capture.rd(mm, ffmacro.FUSECTRL), 4 << 16)
+        self.assertEqual(capture.rd(mm, "0x00820000"), 4 << 16)
+        capture.wr(mm, ffmacro.FUSEADDR, 9)
+        self.assertEqual(mm.words[ffmacro.FUSEADDR], 9)
+        capture.wr(mm, "0x0082000c", 0x100000000 + 5)   # masked to 32 bits
+        self.assertEqual(mm.words[ffmacro.FUSEWDATA], 5)
+
+    def test_capture_rows_over_real_accessors(self):
+        # regression: ffmacro calls rd(PMC_BOOT_0) with an int, which used to
+        # raise TypeError: int() can't convert non-string with explicit base
+        mm = FakeMmap({ffmacro.PMC_BOOT_0: 0x10000001,
+                       ffmacro.FUSECTRL: 4 << 16,
+                       ffmacro.FUSEADDR: 77})
+        rows = ffmacro.capture_rows(functools.partial(capture.rd, mm),
+                                    functools.partial(capture.wr, mm),
+                                    first=0, last=3, sleep=lambda s: None)
+        self.assertEqual(rows, dict((r, r * 3) for r in range(4)))
+        self.assertEqual(mm.words[ffmacro.FUSEADDR], 77)  # address restored
 
 
 ALLLOG = os.path.join(os.path.dirname(__file__), "..",

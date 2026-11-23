@@ -21,6 +21,7 @@ import argparse
 import io
 import json
 import mmap
+import operator
 import os
 import struct
 import sys
@@ -64,13 +65,26 @@ def open_bar0(bdf=None):
     return cands[0], mm
 
 
+def _off(addr):
+    """BAR0 offset as an int, from either address style we pass around.
+
+    The JSON map stores hex strings ("0x0082036c"); ffmacro hands us plain
+    ints (PMC_BOOT_0, FUSECTRL, ...). int(addr, 0) alone raises TypeError on
+    an int under Python 3 ("int() can't convert non-string with explicit
+    base"), which would kill every fuse macro command before the first read.
+    """
+    if isinstance(addr, str):
+        return int(addr, 0)
+    return operator.index(addr)
+
+
 def rd(mm, addr):
-    mm.seek(int(addr, 0))
+    mm.seek(_off(addr))
     return struct.unpack("<I", mm.read(4))[0]
 
 
 def wr(mm, addr, value):
-    mm.seek(int(addr, 0))
+    mm.seek(_off(addr))
     mm.write(struct.pack("<I", value & 0xffffffff))
 
 
