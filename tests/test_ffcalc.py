@@ -102,6 +102,33 @@ class TestDump(unittest.TestCase):
         self.assertFalse(any("fbp_disable" in r["fields"]
                              for r in obj2["burn"]))
 
+    def test_default_plan_burns_the_same_records_it_always_did(self):
+        """Nothing outside --a100 may move for a user who never asks for it:
+        the rows, block values and records below are exactly what the code
+        produced before the identity rewrite existed. Only the `fields` labels
+        changed, and only to stop naming a field whose bits a record leaves
+        alone (block39 used to claim pcie_devidb)."""
+        obj = plan(self.dump)
+        self.assertEqual(
+            [(r["row"], r["chain"], r["block"], r["old"], r["new"],
+              r["record"]) for r in obj["burn"]],
+            [(240, 1, 6, "0x6000", "0x0000", "0x00000181"),
+             (241, 1, 7, "0x0198", "0x0180", "0x018001c1"),
+             (242, 1, 12, "0x0606", "0x0204", "0x02040301"),
+             (243, 1, 13, "0x0707", "0x4081", "0x40810341"),
+             (244, 1, 14, "0x8787", "0x1020", "0x10200381"),
+             (245, 1, 15, "0x07c7", "0x0008", "0x000803c1"),
+             (246, 1, 19, "0x4290", "0x4200", "0x420004c1"),
+             (247, 1, 20, "0x0620", "0x0420", "0x04200501"),
+             (248, 1, 23, "0x0027", "0x0000", "0x000005c1"),
+             (249, 2, 39, "0x0002", "0x0000", "0x000009c2"),
+             (250, 2, 47, "0x0008", "0x0000", "0x00000bc2"),
+             (251, 2, 49, "0x00c0", "0x0000", "0x00000c42")])
+        for key in ("pcie_devida", "pcie_devidb", "magic_d"):
+            self.assertNotIn(key, obj["targets"])
+        self.assertFalse([w for w in obj["warnings"]
+                          if "FUSED device id" in w or "MAGIC_BITS_D" in w])
+
     def test_rows_after_last_used(self):
         obj = plan(self.dump)
         rows = [r["row"] for r in obj["burn"]]
@@ -124,35 +151,175 @@ class TestDump(unittest.TestCase):
         res = simulate(dict(self.dump, ff_rows={}), obj)
         self.assertTrue(any("ff rows readout" in e for e in res["errors"]))
 
-    def test_a100_rewrites_magic_whole_word(self):
+    def test_a100_rewrites_fused_devid(self):
+        """--a100 burns the device id itself, the way the community conversion
+        reports it: chain2 blk37/38 to 0x416a (0x20b5 << 1), and it says what
+        that costs."""
         obj = plan(self.dump, a100=True)
-        b46 = [r for r in obj["burn"] if r["block"] == 46]
-        b47 = [r for r in obj["burn"] if r["block"] == 47]
-        self.assertEqual(len(b46), 1)
-        self.assertEqual(int(b46[0]["new"], 0), 0x8000)
-        self.assertIn("magic_d", b46[0]["fields"])
-        self.assertEqual(len(b47), 1)
-        self.assertEqual(int(b47[0]["new"], 0), 0)
-        self.assertIn("magic_d", b47[0]["fields"])
-        self.assertEqual(obj["targets"]["magic_d"], "0x200000")
-        self.assertTrue(any("EXPERIMENTAL" in w for w in obj["warnings"]))
+        by_block = dict((r["block"], r) for r in obj["burn"]
+                        if r["block"] in (37, 38))
+        self.assertEqual(sorted(by_block), [37, 38])
+        self.assertEqual(int(by_block[37]["new"], 0), 0x416a)
+        self.assertEqual(by_block[37]["record"], "0x416a0942")
+        self.assertEqual(by_block[37]["fields"], ["pcie_devida"])
+        self.assertEqual(int(by_block[38]["new"], 0), 0x416a)
+        self.assertEqual(by_block[38]["record"], "0x416a0982")
+        self.assertEqual(by_block[38]["fields"], ["pcie_devidb"])
+        self.assertEqual(obj["targets"]["pcie_devida"], "0x20b5")
+        self.assertEqual(obj["targets"]["pcie_devidb"], "0x20b5")
+        warn = " ".join(obj["warnings"])
+        for must in ("FUSED device id", "vBIOS", "CH341A", "MMIO"):
+            self.assertIn(must, warn)
+        # full capability + Gen4 do not need the conversion, so say so
+        self.assertIn("do NOT need this", warn)
         res = simulate(self.dump, obj)
         self.assertEqual(res["errors"], [])
 
-    def test_a100_noop_when_magic_already_a100(self):
+    def test_a100_noop_when_devid_already_a100(self):
         rows = dict(self.dump["ff_rows"])
         free = sorted(int(r, 0) if isinstance(r, str) else r
                       for r, v in rows.items()
                       if (v if isinstance(v, int) else int(v, 0)) == 0)
-        rows[free[0]] = ffrecord.encode(2, 46, 0x8000)
-        rows[free[1]] = ffrecord.encode(2, 47, 0x0000)
+        rows[free[0]] = ffrecord.encode(2, 37, 0x416a)
+        rows[free[1]] = ffrecord.encode(2, 38, 0x416a)
         obj = plan(dict(self.dump, ff_rows=rows), a100=True)
-        self.assertFalse([r for r in obj["burn"] if r["block"] in (46, 47)])
+        self.assertFalse([r for r in obj["burn"] if r["block"] in (37, 38)])
+        self.assertFalse(any("FUSED device id" in w for w in obj["warnings"]))
+
+    def test_devid_untouched_without_a100(self):
+        obj = plan(self.dump)
+        for key in ("pcie_devida", "pcie_devidb"):
+            self.assertNotIn(key, obj["targets"])
+        self.assertFalse([r for r in obj["burn"] if r["block"] in (37, 38)])
+
+    def test_a100_old_is_the_factory_record_when_the_readout_covers_it(self):
+        """A card fused as CMP carries its own chain-2 record for blocks 37/38,
+        and a full readout sees it: then `old` is the id in use, `new` is the
+        A100 one, and there is nothing to cross-check."""
+        rows = dict(self.dump["ff_rows"])
+        free = sorted(int(r, 0) if isinstance(r, str) else r
+                      for r, v in rows.items()
+                      if (v if isinstance(v, int) else int(v, 0)) == 0)
+        rows[free[0]] = ffrecord.encode(2, 37, 0x4184)   # 0x20c2 << 1
+        rows[free[1]] = ffrecord.encode(2, 38, 0x4184)
+        words = dict(self.dump["option_words"], pcie_devida=0x20C2,
+                     pcie_devidb=0x20C2)
+        dump = dict(self.dump, ff_rows=rows, option_words=words)
+        obj = plan(dump, a100=True)
+        olds = dict((r["block"], r["old"]) for r in obj["burn"]
+                    if r["block"] in (37, 38))
+        self.assertEqual(olds, {37: "0x4184", 38: "0x4184"})
+        self.assertFalse([w for w in obj["warnings"]
+                          if "fuse register" in w])
+        self.assertEqual(simulate(dump, obj)["errors"], [])
+
+    def test_half_an_id_warns(self):
+        """One half of the id is not an id: naming it must be deliberate."""
+        obj = plan(self.dump, overrides={"pcie_devida": 0x20b5})
+        self.assertTrue(any("only pcie_devida is rewritten" in w
+                            for w in obj["warnings"]))
+
+    def test_a100_also_declares_full_pcie_capability(self):
+        """--a100 takes the whole MAGIC_BITS_D declaration with it: a card that
+        pays the vBIOS price to be an A100 should not keep declaring CMP-era
+        capability next to an A100 id. The value is a guess, so the plan says
+        so and points at the escape hatch."""
+        obj = plan(self.dump, a100=True)
+        by_block = dict((r["block"], r) for r in obj["burn"]
+                        if r["chain"] == 2 and r["block"] in (45, 46, 47))
+        self.assertEqual(sorted(by_block), [46, 47])
+        self.assertEqual(obj["targets"]["magic_d"], "0x200000")
+        # bit21 of the word lives in block46, bit25 in block47
+        self.assertEqual(by_block[46]["record"], "0x80000b82")
+        self.assertEqual(by_block[46]["fields"], ["magic_d"])
+        self.assertEqual(by_block[47]["new"], "0x0000")
+        self.assertEqual(sorted(by_block[47]["fields"]),
+                         ["magic_d", "pcie_magic_gen4_dis"])
+        warn = " ".join(obj["warnings"])
+        self.assertIn("capability declaration", warn)
+        self.assertIn("EXPERIMENTAL", warn)
+        self.assertIn("--skip magic_d", warn)
+        self.assertEqual(simulate(self.dump, obj)["errors"], [])
+        # and the escape hatch has to work: the conversion report itself
+        # leaves this word alone, so --skip magic_d has to leave no trace of it
+        obj = plan(self.dump, a100=True, skip=["magic_d"])
+        self.assertNotIn("magic_d", obj["targets"])
+        self.assertFalse([r for r in obj["burn"] if "magic_d" in r["fields"]])
+        self.assertFalse([w for w in obj["warnings"]
+                          if "capability declaration" in w])
+        self.assertTrue([r for r in obj["burn"] if r["block"] in (37, 38)])
+        self.assertEqual(simulate(self.dump, obj)["errors"], [])
+
+    def test_magic_d_whole_word_is_opt_in_and_still_experimental(self):
+        """MAGIC_BITS_D is a capability declaration, so it is never a default
+        target: --a100 or an explicit --set has to ask for it, and the A100
+        value for it remains a guess that keeps warning."""
+        obj = plan(self.dump, overrides={"magic_d": 0x00200000})
+        b46 = [r for r in obj["burn"] if r["block"] == 46]
+        self.assertEqual(len(b46), 1)
+        self.assertEqual(int(b46[0]["new"], 0), 0x8000)
+        self.assertIn("magic_d", b46[0]["fields"])
+        self.assertEqual(obj["targets"]["magic_d"], "0x200000")
+        self.assertTrue(any("EXPERIMENTAL" in w for w in obj["warnings"]))
+        self.assertTrue(any("capability declaration" in w
+                            for w in obj["warnings"]))
+        res = simulate(self.dump, obj)
+        self.assertEqual(res["errors"], [])
 
     def test_magic_not_touched_without_a100(self):
         obj = plan(self.dump)
         self.assertNotIn("magic_d", obj["targets"])
         self.assertFalse([r for r in obj["burn"] if r["block"] == 46])
+
+
+class TestIdentitySurface(unittest.TestCase):
+    """The identity rewrite is the one burn that changes what the card *is*, so
+    every surface that ends in a burn says so: `report` shows the id the chip
+    carries and what a plan would make it carry, and the plan/burn path repeats
+    the cost (vBIOS flash, CH341A as the only way back)."""
+
+    def setUp(self):
+        self.dump = load_dump(SAMPLE)
+        self.tmp = tempfile.mkdtemp(prefix="ffcalc-ident-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.words = dict(self.dump["option_words"])
+        self.words["pcie_devida"] = 0x20C2
+        self.words["pcie_devidb"] = 0x20C2
+        self.card = os.path.join(self.tmp, "card.json")
+        with open(self.card, "w") as f:
+            json.dump({"sku": "8gb", "option_words": self.words,
+                       "ff_rows": dict(("%d" % r, v) for r, v
+                                       in self.dump["ff_rows"].items())}, f)
+
+    def test_report_shows_the_fused_id_and_no_change(self):
+        rc, out = quiet(["report", self.card])
+        self.assertEqual(rc, 0)
+        self.assertIn("[Fused device id]", out)
+        self.assertIn("devida=0x20c2  devidb=0x20c2", out)
+        self.assertIn("no id change planned", out)
+
+    def test_report_of_a_conversion_names_the_price(self):
+        rc, out = quiet(["report", self.card,
+                         "--set", "pcie_devida=0x20b5",
+                         "--set", "pcie_devidb=0x20b5",
+                         "--set", "magic_d=0x200000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("target: devida=0x20b5", out)
+        # the capability word gets its own line: it is the part of the plan
+        # whose value nobody has measured
+        self.assertIn("MAGIC_BITS_D -> 0x00200000", out)
+        self.assertIn("CH341A", out)
+
+    def test_gen_a100_prints_the_conversion_warning(self):
+        rc, out = quiet(["gen", self.card, "-o",
+                         os.path.join(self.tmp, "plan.json"), "--a100"])
+        self.assertEqual(rc, 0)
+        self.assertIn("0x416a0942", out)
+        self.assertIn("WARN: pcie_devida/pcie_devidb", out)
+        self.assertIn("vBIOS", out)
+        # this readout does not cover the record that carries the id, so the
+        # plan's 0x0000 cannot be the id in use and has to say so
+        self.assertIn("while the fuse register reads 0x20c2", out)
 
 
 class TestFfRowsParsing(unittest.TestCase):
@@ -524,6 +691,40 @@ class TestIngest(unittest.TestCase):
         return cli.main(["scan", "--dir", self._collect_dir(),
                          "--outdir", os.path.join(out, "cards"),
                          "--plans", os.path.join(out, "plans")])
+
+    def test_scan_a100_plans_carry_the_identity_and_capability_rows(self):
+        """The one-shot path has to plan what `gen --a100` plans, and let the
+        capability word be declined from there too (ffscan.sh --no-magic-d)."""
+        out = tempfile.mkdtemp(prefix="ffcalc-out-")
+        self.addCleanup(shutil.rmtree, out, True)
+        d = self._collect_dir()
+        for _bdf, _uuid in UUIDS.values():
+            path = os.path.join(d, "probe_%s.txt" % ingest.sanitize(_bdf))
+            with open(path, "a") as f:
+                f.write("\n" + "\n".join(self._ffrow_lines()))
+        first = list(UUIDS.values())[0][1][4:]
+
+        def scan(tag, extra):
+            plans = os.path.join(out, "plans-" + tag)
+            rc = cli.main(["scan", "--dir", d, "--outdir",
+                           os.path.join(out, "cards"), "--plans", plans]
+                          + extra)
+            self.assertEqual(rc, 0)
+            with open(os.path.join(plans, first + ".burn.json")) as f:
+                obj = json.load(f)
+            return obj, dict((r["block"], r) for r in obj["burn"])
+
+        obj, by_block = scan("a100", ["--a100"])
+        self.assertEqual(by_block[37]["record"], "0x416a0942")
+        self.assertEqual(by_block[38]["record"], "0x416a0982")
+        self.assertEqual(int(by_block[46]["new"], 0), 0x8000)
+        self.assertTrue(any("capability declaration" in w
+                            for w in obj["warnings"]))
+        obj, by_block = scan("no-magic", ["--a100", "--skip", "magic_d"])
+        self.assertNotIn("magic_d", obj["targets"])
+        self.assertEqual(by_block[37]["record"], "0x416a0942")
+        self.assertFalse([r for r in obj["burn"]
+                          if "magic_d" in r["fields"]])
 
     def _merge_rows(self, out):
         rows = write_rows_file(load_dump(SAMPLE),

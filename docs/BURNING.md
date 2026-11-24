@@ -37,13 +37,15 @@ FUSECTRL idle(4) ∧ FUSEDEBUG=0 ∧ CRC_STATUS=0x55 ∧ EFP=1 ∧ DSOV=0
 
 ## 3. 烧写流程（burntool 自动执行，逐条断言）
 
-1. **离线核验**（不碰卡）：`simulate(plan, dump)` 必须 0 错误 —— 记录重编码、行占用、old==快照回放、目标行空白、FF 范围。官方 `ffcalc verify --dir collected` 现场再验一次 UUID/fingerprint。在此之前两个输入文件本身必须可解析：计划缺少 `burn` 列表，或快照任一行不合法（行号越界、值超出 32 位、JSON 不完整、同一行两个值），一律 `REFUSED` 且**卡未被写入**（rc=1）。快照无法解析即无从得知该行当前内容，不具备烧写条件。
-2. `status`：确认在写窗口内、控制器未因失败锁死。
-3. `CMD_SENSE`：完成后 DSOV 必须仍为 0，否则**不烧**。
-4. **现场逐行对快照**：计划涉及的每一行 CMD_READ 回读，必须与 dump 的 `ff_rows` 一致（防错卡/防中途被烧）。
-5. `arm`：写 `SBFE_SHADOW=0`、`WDATA_WR_SECURE=0`，断言 `armed_problems()==[]`（idle/debug/CRC/EFP/DSOV/SBFE/WSEC 七项）。
-6. 每条记录：`program_row` = 断言已授权 → 目标行读 0 → 锁行校验 → 写 `FUSEWDATA` → `CMD_PROGRAM` → 等 IDLE（≤10 s）→ **回读必须等于记录值**。任何一条不符立即中止。目标行若**已经恰好等于该记录值**（上次中断已烧成）则原样跳过——中断后直接重跑同一计划是安全的。
-7. 收尾：再读 `status`（CRC 应仍 `0x55`），冷启动，重跑 `ffscan.sh`：fingerprint 的 defective 部分不变（SBFE 位翻转为 1 属预期），剩余计划应显著缩短/为空。
+1. **先读计划自己**：burntool 打印 `plan["warnings"]`（若含熔丝 devid 改写，还会额外一条 `NOTICE`：后面欠一次 A100 vBIOS 刷写，POST 挂死只剩 CH341A），这些必须在 `YES` 之前看到。
+2. **离线核验**（不碰卡）：`simulate(plan, dump)` 必须 0 错误 —— 记录重编码、行占用、old==快照回放、目标行空白、FF 范围。官方 `ffcalc verify --dir collected` 现场再验一次 UUID/fingerprint。在此之前两个输入文件本身必须可解析：计划缺少 `burn` 列表，或快照任一行不合法（行号越界、值超出 32 位、JSON 不完整、同一行两个值），一律 `REFUSED` 且**卡未被写入**（rc=1）。快照无法解析即无从得知该行当前内容，不具备烧写条件。
+3. `YES`：确认发生在警告与离线核验**之后**——先让人看到风险，再问要不要动手。
+4. `status`：确认在写窗口内、控制器未因失败锁死。
+5. `CMD_SENSE`：完成后 DSOV 必须仍为 0，否则**不烧**。
+6. **现场逐行对快照**：计划涉及的每一行 CMD_READ 回读，必须与 dump 的 `ff_rows` 一致（防错卡/防中途被烧）。
+7. `arm`：写 `SBFE_SHADOW=0`、`WDATA_WR_SECURE=0`，断言 `armed_problems()==[]`（idle/debug/CRC/EFP/DSOV/SBFE/WSEC 七项）。
+8. 每条记录：`program_row` = 断言已授权 → 目标行读 0 → 锁行校验 → 写 `FUSEWDATA` → `CMD_PROGRAM` → 等 IDLE（≤10 s）→ **回读必须等于记录值**。任何一条不符立即中止。目标行若**已经恰好等于该记录值**（上次中断已烧成）则原样跳过——中断后直接重跑同一计划是安全的。
+9. 收尾：再读 `status`（CRC 应仍 `0x55`），冷启动，重跑 `ffscan.sh`：fingerprint 的 defective 部分不变（SBFE 位翻转为 1 属预期），剩余计划应显著缩短/为空。
 
 **首次试烧**建议 `--rows <单行>`（如 fbp 那条），验证 PROGRAM 行为与 CRC 自补后再上全量——本次实测就是这么做的（315 行先烧，`0x420004c1` 一次成功）。
 
@@ -60,15 +62,29 @@ burntool 在每一步都检测锁死并以此消息中止（rc=3）。
 
 ## 5. 实卡完整验证记录（UUID 对应 fingerprint 前缀 2d827969）
 
-- 17 条记录烧入行 304–320：`fbp 0x852→0x840`、`fbpa/fbio/rop_l2 0xc0330c→0xc03000`、`gpc→0x20`、`tpc4→0x40`、`tpc7→0x20`、`pes→0x38000`、`nvlink/sys_pipe→0`、PCIe Gen4 位清零（含 `MAGIC_D` 未烧，Gen4 仍通）。
+- 17 条记录烧入行 304–320：`fbp 0x852→0x840`、`fbpa/fbio/rop_l2 0xc0330c→0xc03000`、`gpc→0x20`、`tpc4→0x40`、`tpc7→0x20`、`pes→0x38000`、`nvlink/sys_pipe→0`、PCIe Gen4 位清零（block39 的两个 `DISABLE_GEN3_SPEED` 位 + `MAGIC_BITS_D` bit25；整字 MAGIC_D 未动）。
 - 每条烧写前七项授权断言 + 现场空白检查全过；每条回读一致；全程未出现锁死。
 - 冷启动后：`BOOT0=0x170000a1`、CRC=`0x55`、DSOV=1、SBFE=1；FF 区 222–486 除新 17 行外零改动；defective 16/16 不变（同一块 die）。
 - `tpc_gpc3/6_disable` 在 **status 层**显示 `0x1`（fused 层 =0x0）：OEM 固件运行时自屏蔽，参考机上未烧卡的同字段行为相同，**属正常现象**，别再往这两个位上补烧。
 - 烧写使 SBFE=1 → fingerprint 变为 `3ab5093e8f9f78b5`（defective 基不变）。用**烧后指纹**认后续快照。
-- 重生成计划 = 0 条：潜力 80 GiB / 108 SM / NVLink / Gen4 全部就位；驱动层（geometry/Gen4）另行处理，与 FF 无关。
+- 重生成计划 = 0 条：潜力 80 GiB / 108 SM / NVLink / Gen4 全部就位；驱动层（geometry/Gen4）另行处理，与 FF 无关。Gen4 能起来靠的是 `MAGIC_BITS_D` bit25 被清（那是 PCIe **能力宣告**，不代表实际速率），整字 MAGIC_D 未动也不影响。
 - **指纹不是唯一身份证**：defective+SBFE 的哈希在同批次卡之间会相同（同批卡的出厂卡 SBFE 本来就是 1，其指纹与我们烧穿后重算的指纹一模一样——我们曾被这份烧前旧快照误导过一次）。fingerprint 只用来核对"烧前烧后同一块 die"，**认卡、对计划必须用 UUID**；burntool 逐行对快照是 UUID 之外的最后一道闸。
 
-## 6. 踩坑速查（本流程实际踩过或已替你挡住）
+## 6. 计划里有 `pcie_devida` / `pcie_devidb` 时（A100 身份转换）
+
+`ffcalc gen --a100` 会多出身份相关的记录：chain2 blk37（DEVIDA）、blk38（DEVIDB）写 `0x416a` = `0x20B5<<1`，即 `0x416A0942` / `0x416A0982`；外加把整字 MAGIC_BITS_D 写成 `0x00200000`（按卡现值涉及 blk45/46/47 中真正变化的那几块）。**状态：身份那两条出自社区/他人的实测报告，本仓库还没在自己的卡上走过；MAGIC_BITS_D 的整字改写更不是报告步骤，是我们「都要当 A100 就把能力宣告满」的判断，`0x00200000` 没人从真 A100 上读过**——我们能验证的是编码与记录格式自洽（自家 FF 快照里 blk37/38 回放出的就是 `0x4184`，`gen --a100` 生成的就是上面那两条），平台侧结果（POST、BAR1 128G、驱动识别）一律按未验证对待。不认可整字改写就 `--a100 --skip magic_d`，退化成「只烧报告烧过的那两条」。
+
+烧写动作与其它记录**完全相同**——同一套 SENSE→arm→PROGRAM→回读断言，同样多的空白行，本文前面的规则一条不漏。不同的是烧完之后的世界：
+
+1. **身份那两条改变的是「这张卡是谁」**：冷启动后芯片自己就是 `10de:20b5`，lspci、驱动、GSP/DevInit 的启动门槛全部按 A100 认它。其它记录（含 MAGIC_BITS_D 那几条）只改容量/SM/链路/能力宣告，从不碰身份。
+2. **烧完不等于结束**：SPI 里还是 CMP ROM 时，VBIOS devid 与熔丝 devid 不匹配，卡起不来。门槛比的是**熔丝 devid**，所以必须 `nvflash` 刷一份 A100 80GB PCIe vBIOS（ROM 不用改一个字节）。`nvflash --save` 先备份这张卡自己的 CMP ROM。
+3. **带内无退路**：平台 POST 不过 → 驱动不在 → nvflash 进不去 → 只能 CH341A + SOP8 夹离线刷 SPI。这就是「没备好 CH341A 和烙铁不要烧这几条」的原因。熔丝本身可以再补一条记录把 id 指回别的值（链内后写覆盖先写），但前提仍是卡能冷启动回到烧写窗口。
+4. **平台门槛**：A100 VBIOS 声明 BAR1=128GB，BIOS 必须给得出 128 GB 的 64-bit prefetchable BAR1（`Above 4G Decoding` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G`），否则卡死在 VGA 灯上。判据是 MMIO 窗口，不是主板新旧。
+5. **`old` 列是 FF 层对该块的回放值**：实卡出厂就在 FF 链里写了 `0x4184`（= `0x20C2<<1`），所以正常看到 `0x4184 -> 0x416a`。如果这次读出的行没覆盖到承载 id 的那条记录，`old` 会显示 `0x0000`，计划会额外警告「回放值与熔丝寄存器读数不一致」——记录写的是整块新值（链内后写覆盖先写），不受影响，但要用 `ffcalc report` 的 `[Fused device id]`（读熔丝寄存器 `0x8204d8`/`0x82056c`）确认现在到底是哪个 id。
+6. burntool 在 `YES` 之前会打印计划警告与一条 `NOTICE`，并跑完离线核验才发问——**别不看就敲 YES**。
+7. 转换之后 `scripts/ffscan.sh` 仍能找到这张卡（`0x20c2` 与 `0x20b5` 都认），闭环检查照做。
+
+## 7. 踩坑速查（本流程实际踩过或已替你挡住）
 
 | 症状 | 原因 | 处置 |
 |---|---|---|
@@ -79,3 +95,8 @@ burntool 在每一步都检测锁死并以此消息中止（rc=3）。
 | `tpc3/6` status≠fused | 固件运行时自屏蔽 | 正常，fused 层对即可 |
 | 拿错卡烧错行 | 槽位变了 UUID/指纹没对 | 第 1、4 步的 UUID/fingerprint/逐行对快照三道闸全部必过 |
 | 计划里行号变了 | 上一次烧写后旧计划作废 | 每轮烧完重新 `scan`，以新计划为准 |
+| 烧完 devid 后卡不 POST / 不初始化 | 熔丝已是 A100 `0x20B5`，SPI 里还是 CMP ROM（ID 不匹配，门槛比的是熔丝） | 刷 A100 80GB PCIe vBIOS；已经挂死则 CH341A 离线刷 SPI |
+| 刷了 A100 ROM 仍卡 VGA 灯 | 平台没给出 128G 64-bit prefetchable BAR1 | `Above 4G` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G` |
+| 转 A100 后 `ffscan.sh` 扫不到卡 | 脚本原先只认 device `0x20c2` | 现在 `0x20c2`/`0x20b5` 都认；`capture.py`/`burntool` 同样两种都收 |
+| 只烧了 `pcie_devida` 或只烧了 `pcie_devidb` | 两份 id 不一致，门槛读哪份无文档 | 计划已警告；同一轮把两半补齐 |
+| 按 `--a100` 烧了 MAGIC_BITS_D，之后想收回 | 整字值 `0x00200000` 是社区猜测，报告里根本没动这个字 | 补一条记录把该块写成别的值（链内后写覆盖先写，前提仍是能进烧写窗口）；不确定就别烧：`--a100 --skip magic_d` |

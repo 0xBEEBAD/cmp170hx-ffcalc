@@ -28,11 +28,17 @@ import sys
 
 from . import dump as snapshot
 from . import ffmacro, ffrows
+from .optionmap import A100_DEVID, CMP_DEVID
 
 BAR0_LEN = 0x1000000
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MAP = os.path.join(_HERE, "data", "ga100-fuses.json")
+
+# Same GA100 die and the same fuse map, before and after a --a100 conversion:
+# burning the fused device id to 0x20b5 changes what the card calls itself,
+# not what it is, so capture and burn have to keep finding it either way.
+DEVICE_IDS = tuple("0x%04x" % v for v in (CMP_DEVID, A100_DEVID))
 
 
 def open_bar0(bdf=None):
@@ -45,14 +51,14 @@ def open_bar0(bdf=None):
                 dev_id = f.read().strip()
         except IOError:
             continue
-        if dev_id != "0x20c2":
+        if dev_id not in DEVICE_IDS:
             continue
         cands.append(dev)
     if bdf:
         want = bdf if len(bdf.split(":")) == 3 else "0000:" + bdf
         cands = [c for c in cands if c == want] or [want]
     if not cands:
-        raise SystemExit("no device 0x20c2 found")
+        raise SystemExit("no device %s found" % " or ".join(DEVICE_IDS))
     path = os.path.join(base, cands[0], "resource0")
     # Same access pattern cmpunlocker uses against a live nvidia driver:
     # fd opened O_RDWR, mapping ACCESS_WRITE. Word capture reads only;

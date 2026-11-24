@@ -7,7 +7,7 @@ from .analyze import analyze
 from .dump import (BadSnapshot, atomic_write_json, load_dump, load_plan,
                    update_rows)
 from .generate import plan
-from .optionmap import BY_KEY, FF_ROW_MAX, FF_ROW_MIN
+from .optionmap import BY_KEY, DEVID_KEYS, FF_ROW_MAX, FF_ROW_MIN
 from .simulate import simulate
 
 
@@ -92,8 +92,41 @@ def _print_analysis(rep):
         "  (needs U11 bridge mod + ROM check bypass)" if nv else ""))
     print("  PCIe Gen3/4: %s" % ("bits clearable" if rep["pcie_gen4_ok"]
                                  else "stays restricted"))
+    _print_devid(rep)
     for msg in rep["warnings"]:
         print("  WARN: %s" % msg)
+
+
+def _print_devid(rep):
+    """What the chip is fused as, and what a plan would make it claim.
+
+    Read from the device-id fuse registers (`option_words`), not from the FF
+    replay: an unburnt card keeps its id in the initial fuse array, where the
+    FF snapshot cannot see it, so the FF-replayed value would read 0x0 and
+    invite somebody to "fix" a number that was never wrong.
+    """
+    w, t = rep["words"], rep["targets"]
+    label = dict((k, k.replace("pcie_", "")) for k in DEVID_KEYS)
+    now = "  ".join("%s=%s" % (label[k], "0x%04x" % w[k]) for k in DEVID_KEYS
+                    if w.get(k) is not None)
+    tgt = "  ".join("%s=0x%04x" % (label[k], t[k]) for k in DEVID_KEYS
+                    if k in t)
+    print("\n[Fused device id]")
+    print("  fused as: %s (this is what lspci reports)" % (now or "not read"))
+    if "magic_d" in t:
+        # --a100 (or --set) takes the capability word along with the id, and
+        # that value is the one part of it nobody has read off a real A100.
+        print("  capability word: MAGIC_BITS_D -> 0x%08x, EXPERIMENTAL "
+              "community guess (--skip magic_d to leave it alone)"
+              % t["magic_d"])
+    if not tgt:
+        print("  no id change planned: the card stays what it is fused as, "
+              "which is all full capability + Gen4 need")
+    else:
+        print("  target: %s" % tgt)
+        print("  WARN: the card only comes up under a vBIOS that carries that "
+              "id, and a platform that stops POSTing leaves only CH341A "
+              "offline recovery of the SPI rom")
 
 
 def _dispatch(argv=None):
@@ -117,9 +150,15 @@ def _dispatch(argv=None):
                    help="FF rows file to merge before planning "
                         "(see ffcalc mergeff)")
     p.add_argument("--a100", action="store_true",
-                   help="EXPERIMENTAL (community-sourced, untested on a "
-                        "real A100): also rewrite MAGIC_BITS_D to "
-                        "0x200000 for A100 vBIOS compatibility")
+                   help="HIGH RISK (community-reported, not reproduced on our "
+                        "cards): rewrite the FUSED device id 0x20c2 -> 0x20b5 "
+                        "(chain2 blk37/38) so an A100 80GB PCIe vBIOS boots, "
+                        "and take the whole MAGIC_BITS_D capability word with "
+                        "it (--skip magic_d for the conversion report's "
+                        "minimum). You then have to flash that vBIOS "
+                        "yourself, and a platform that fails to POST leaves "
+                        "only CH341A recovery. Not needed for full capability "
+                        "+ Gen4: the default plan covers that")
 
     p = sub.add_parser("mergeff", help="merge an externally-read FF rows "
                        "dump (e.g. fuse macro CMD_READ) into a card dump")
@@ -140,9 +179,12 @@ def _dispatch(argv=None):
     p.add_argument("--plans", default="plans")
     p.add_argument("--sku", default="8gb", choices=("8gb", "10gb"))
     p.add_argument("--no-gen", action="store_true")
+    p.add_argument("--skip", help="comma-separated keys to ignore in plans")
     p.add_argument("--a100", action="store_true",
-                   help="EXPERIMENTAL: plans also rewrite MAGIC_BITS_D to "
-                        "0x200000 (community-sourced, untested)")
+                   help="HIGH RISK: plans rewrite the fused device id to "
+                        "0x20b5 and the whole MAGIC_BITS_D word, which "
+                        "commits you to an A100 vBIOS flash (CH341A is the "
+                        "only way back). Default plans need neither")
 
     p = sub.add_parser("verify", help="check that a burn plan belongs to "
                        "the card currently in the machine")
@@ -260,9 +302,11 @@ def _dispatch(argv=None):
             rep = analyze(dump)
             dpath = ingest.save_dump(args.outdir, dump)
             pinfo = "-" if args.no_gen else "SKIPPED (FF rows not read)"
+            pwarns = []
             if not args.no_gen:
                 try:
-                    obj = plan(dump, a100=args.a100)
+                    obj = plan(dump, a100=args.a100,
+                               skip=args.skip.split(",") if args.skip else [])
                 except ffrows.FFRowsNotRead:
                     no_ffrows.append(dpath)
                 else:
@@ -272,13 +316,14 @@ def _dispatch(argv=None):
                                          ingest.card_id(dump) + ".burn.json")
                     atomic_write_json(ppath, obj)
                     pinfo = "%s (%d records)" % (ppath, len(obj["burn"]))
-            rows.append((dump, rep, pinfo))
+                    pwarns = obj["warnings"]
+            rows.append((dump, rep, pinfo, pwarns))
         if not rows:
             print("no cards found under %s/bar0map.tsv" % args.dir)
             return 1
         print("%-38s  %-12s  %-13s  %4s  %-9s  plan"
               % ("card UUID", "BDF", "FB now->max", "SM", "FP"))
-        for dump, rep, pinfo in rows:
+        for dump, rep, pinfo, _ in rows:
             fb = ("%s->%s GiB" % (rep["fb_now_gib"], rep["fb_gib"])
                   if rep["fb_now_gib"] is not None else "?")
             print("%-38s  %-12s  %-13s  %4s  %-9s  %s"
@@ -286,8 +331,10 @@ def _dispatch(argv=None):
                      dump.get("bdf", "?"), fb,
                      rep["sm_count"] if rep["sm_count"] is not None else "?",
                      dump["fingerprint"], pinfo))
-        for dump, rep, _ in rows:
-            for wmsg in rep["warnings"]:
+        for dump, rep, _, pwarns in rows:
+            # The plan repeats the analysis warnings and adds its own (what a
+            # fused-device-id row really costs), so print the plan's set once.
+            for wmsg in (pwarns or rep["warnings"]):
                 print("WARN %s: %s" % (dump.get("uuid") or
                                        dump.get("fingerprint"), wmsg))
         if no_ffrows:

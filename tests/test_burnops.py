@@ -73,6 +73,19 @@ PLAN = {"uuid": "GPU-test", "fingerprint": "abc",
                   "block": 19, "old": "0x4290", "new": "0x4200",
                   "fields": ["fbp_disable"]}]}
 
+# A --a100 plan cut down to its two identity rows -- the records the community
+# conversion report burned. The plan carries its own warnings, because burntool
+# echoes them for a hand-written plan or one from an older ffcalc as well.
+DEVID_PLAN = {
+    "uuid": "GPU-test", "fingerprint": "abc",
+    "targets": {"pcie_devida": "0x20b5", "pcie_devidb": "0x20b5"},
+    "warnings": ["pcie_devida/pcie_devidb: rewrites the FUSED device id"],
+    "burn": [
+        {"row": 316, "record": "0x416a0942", "chain": 2, "block": 37,
+         "old": "0x0000", "new": "0x416a", "fields": ["pcie_devida"]},
+        {"row": 317, "record": "0x416a0982", "chain": 2, "block": 38,
+         "old": "0x0000", "new": "0x416a", "fields": ["pcie_devidb"]}]}
+
 
 class TestBurnOps(unittest.TestCase):
     def setUp(self):
@@ -154,6 +167,43 @@ class TestBurnTool(unittest.TestCase):
             dump["option_words"]["tpc_gpc%d_defective" % i] = "0x0"
         with open(self.dump_path, "w") as f:
             json.dump(dump, f)
+
+    def _plan(self, obj, name="devid.json"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            json.dump(obj, f)
+        return path
+
+    def test_devid_plan_warns_before_the_first_write(self):
+        """A plan that rewrites the fused id has to say so to whoever is about
+        to answer `YES`: an A100 vBIOS is owed after this, and CH341A is the
+        only way back if the platform stops POSTing."""
+        bar = BurnBar(rows={290: 0x429004C1})
+        bar.reg[ffmacro.SBFE_SHADOW] = 0
+        bar.reg[ffmacro.WDATA_WR_SECURE] = 0
+        logs = []
+        rc = burntool.cmd_burn(bar.rd, bar.wr, self._plan(DEVID_PLAN),
+                               self.dump_path, sleep=noop, clock=zero_clock,
+                               log=logs.append)
+        self.assertEqual(rc, 0)
+        text = "\n".join(logs)
+        self.assertIn("plan warning: pcie_devida", text)
+        self.assertIn("NOTICE", text)
+        self.assertIn("vBIOS", text)
+        self.assertIn("CH341A", text)
+        self.assertEqual(bar.programs, [(316, 0x416a0942), (317, 0x416a0982)])
+
+    def test_confirm_gate_blocks_every_write(self):
+        """`YES` is the last gate, and it comes after the offline checks and
+        the warnings: refusing then must leave the card untouched."""
+        bar = BurnBar(rows={290: 0x429004C1})
+        logs = []
+        rc = burntool.cmd_burn(bar.rd, bar.wr, self.plan_path, self.dump_path,
+                               sleep=noop, clock=zero_clock,
+                               log=logs.append, confirm=lambda: False)
+        self.assertEqual(rc, 2, logs)
+        self.assertEqual(bar.programs, [])
+        self.assertEqual(bar.addr, 0, "not even a row address was written")
 
     def test_offline_gate_blocks_used_row(self):
         bar = BurnBar(rows={315: 0xDEADBEEF})

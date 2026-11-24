@@ -13,6 +13,11 @@ burn refuses to touch the card unless:
   3. every target row still reads blank (0x00000000) at burn time -- or
      already holds exactly its planned record (interrupted run: that row is
      skipped, re-running the same plan is safe).
+Before the first write the plan's own warnings are echoed, and the YES prompt
+comes after them and after the offline checks: a plan carrying the fused
+device id rewrite (`ffcalc gen --a100`) says it here, at the moment of no
+return -- the card will come up only under an A100 vBIOS, and a platform that
+stops POSTing leaves only CH341A recovery of the SPI rom.
 Each record is programmed one at a time and read back; a poisoned
 controller (FUSECTRL=0xBADFxxxx) aborts the whole run and you must
 cold-boot before any further access. See docs/BURNING.md.
@@ -24,6 +29,7 @@ import sys
 from . import ffmacro
 from .capture import open_bar0, rd as _rd, wr as _wr
 from .dump import BadSnapshot, load_dump, load_plan
+from .optionmap import DEVID_KEYS
 from .simulate import simulate
 
 
@@ -57,12 +63,36 @@ def cmd_status(rd, log=print):
     return 0
 
 
+def _identity_rows(plan):
+    """Fields of this plan that rewrite the fused id, plus the new id."""
+    keys = {key for rec in plan["burn"] for key in rec.get("fields") or ()}
+    ids = [key for key in DEVID_KEYS if key in keys]
+    if not ids:
+        return None
+    return ids, (plan.get("targets") or {}).get(ids[0])
+
+
 def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
-             sleep=None, clock=None, force=False):
+             sleep=None, clock=None, force=False, confirm=None):
     loaded = _load_pair(plan_path, dump_path, log)
     if loaded is None:
         return 1
     plan, dump = loaded
+    # The plan is the only place the cost of each record was written down, so
+    # read it back out here: whoever holds a live card and a `YES` prompt is
+    # exactly where "this row also changes what the card is" belongs.
+    for msg in plan.get("warnings") or ():
+        log("plan warning: %s" % msg)
+    ident = _identity_rows(plan)
+    if ident:
+        ids, target = ident
+        log("NOTICE: %s rewrite the fused device id to %s. From the next cold "
+            "boot the chip itself is that id, so the card comes up only under "
+            "a vBIOS that carries it -- flash the A100 80GB PCIe rom (after "
+            "backing this card's own rom up), and keep a CH341A + SOP8 clip "
+            "within reach: if the platform stops POSTing there is no in-band "
+            "way back. Full capability + Gen4 needed neither these rows nor "
+            "that flash." % ("/".join(ids), target))
     res = simulate(dump, plan)
     for w in res["warnings"]:
         log("warn: %s" % w)
@@ -70,6 +100,9 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
         for e in res["errors"]:
             log("REFUSED: %s" % e)
         return 1
+    if confirm is not None and not confirm():
+        log("aborted")
+        return 2
     wanted = None
     if rows:
         wanted = {int(r, 0) for r in rows.split(",")}
@@ -173,14 +206,14 @@ def main(argv=None):
     print("card at %s" % bdf)
     if args.cmd == "status":
         return cmd_status(r)
-    if not args.yes:
+
+    def confirm():
         ans = input("burn %s onto %s? type YES to continue: "
                     % (args.plan, bdf))
-        if ans.strip() != "YES":
-            print("aborted")
-            return 2
+        return ans.strip() == "YES"
+
     return cmd_burn(r, w, args.plan, args.dump, rows=args.rows,
-                    force=args.force)
+                    force=args.force, confirm=None if args.yes else confirm)
 
 
 if __name__ == "__main__":
