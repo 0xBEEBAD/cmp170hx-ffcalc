@@ -26,6 +26,7 @@ import os
 import struct
 import sys
 
+from . import dump as snapshot
 from . import ffmacro, ffrows
 
 BAR0_LEN = 0x1000000
@@ -103,8 +104,11 @@ def main():
                          "only)")
     args = ap.parse_args()
 
-    with io.open(args.map, encoding="utf-8") as f:
-        m = json.load(f)
+    try:
+        with io.open(args.map, encoding="utf-8") as f:
+            m = json.load(f)
+    except ValueError as e:
+        raise SystemExit("bad option map %s: %s" % (args.map, e))
 
     bdf, mm = open_bar0(args.bdf)
     words = {}
@@ -142,13 +146,18 @@ def main():
         except ffmacro.FuseControllerError as e:
             print("WARN: CMD_READ pass aborted: %s" % e)
             print("WARN: keeping the %d row(s) read so far" % len(ff_rows))
-    dump = {"sku": args.sku, "bdf": bdf,
-            "ff_rows": dict(("%d" % r, "0x%08x" % v)
-                           for r, v in sorted(ff_rows.items())),
+    dump = {"sku": args.sku, "bdf": bdf, "ff_rows": ff_rows,
             "option_words": words, "info": info,
             "read_only": not wrote_rows}
-    with io.open(args.out, "w", encoding="utf-8") as f:
-        json.dump(dump, f, indent=2, sort_keys=True)
+    try:
+        # One codec for every snapshot on disk: values checked, rows written
+        # as fixed-width "0x%08x", file renamed into place only after it has
+        # been read back -- a capture is the evidence a plan is built from,
+        # it must not be half-written by an interrupted run.
+        dump = snapshot.to_json_form(dump, args.out)
+        snapshot.atomic_write_json(args.out, dump)
+    except snapshot.BadSnapshot as e:
+        raise SystemExit("cannot write %s: %s" % (args.out, e))
     state, missing = ffrows.coverage(dump)
     if state != "complete":
         print("note: FF rows %s (%d of %d unknown); ffcalc will not emit a "

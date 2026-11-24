@@ -37,7 +37,7 @@ FUSECTRL idle(4) ∧ FUSEDEBUG=0 ∧ CRC_STATUS=0x55 ∧ EFP=1 ∧ DSOV=0
 
 ## 3. 烧写流程（burntool 自动执行，逐条断言）
 
-1. **离线核验**（不碰卡）：`simulate(plan, dump)` 必须 0 错误 —— 记录重编码、行占用、old==快照回放、目标行空白、FF 范围。官方 `ffcalc verify --dir collected` 现场再验一次 UUID/fingerprint。
+1. **离线核验**（不碰卡）：`simulate(plan, dump)` 必须 0 错误 —— 记录重编码、行占用、old==快照回放、目标行空白、FF 范围。官方 `ffcalc verify --dir collected` 现场再验一次 UUID/fingerprint。在此之前两个输入文件本身必须可解析：计划缺少 `burn` 列表，或快照任一行不合法（行号越界、值超出 32 位、JSON 不完整、同一行两个值），一律 `REFUSED` 且**卡未被写入**（rc=1）。快照无法解析即无从得知该行当前内容，不具备烧写条件。
 2. `status`：确认在写窗口内、控制器未因失败锁死。
 3. `CMD_SENSE`：完成后 DSOV 必须仍为 0，否则**不烧**。
 4. **现场逐行对快照**：计划涉及的每一行 CMD_READ 回读，必须与 dump 的 `ff_rows` 一致（防错卡/防中途被烧）。

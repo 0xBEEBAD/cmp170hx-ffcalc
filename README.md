@@ -92,7 +92,7 @@ GPU-b6b9f653-ec1d-f20f-829c-243314997fa8 0000:06:00.0  64->64 GiB    124 98fa952
 |---|---|
 | `uuid` / `fingerprint` / `bdf` | 卡的三重身份（PCIe 槽位号 `bdf` 会变，UUID 不变） |
 | `sku` | `8gb`/`10gb`，决定每个 FBP 折算容量 |
-| `ff_rows` | **全部 512 物理行快照**（0–221 regular、222–486 FF、487–511 IFF）；未烧的行值为 0。burn 计划的存在性/正确性完全依赖这个字段覆盖完整 |
+| `ff_rows` | **全部 512 物理行快照**（0–221 regular、222–486 FF、487–511 IFF）；未烧的行值为 0。burn 计划的存在性/正确性完全依赖这个字段覆盖完整。**值的写法两种都合法**：`"0x0fe805c1"` 字符串（`capture` 通道）与 `267006913` int（`ingest` 通道），历史文件里都有，所以读取方必须自己归一化（统一走 `ffcalc/dump.py`，不要绕过它直接 `json.load`）。行号键十进制或 `0x` 均可；无 `0x` 前缀的数按十进制解释。新写入统一为 `0x%08x` |
 | `option_words` | 当前有效值（`status` 优先于 `fused`，含 `*_defective` 底线）；`xxx__fused` 表示该字 status 与 fused 不一致（软件覆盖过） |
 | `info` | 辅助状态字（nvdec、SBFE、half_fbpa 等） |
 | `read_only` | 本次采集是否零写入（跑了 CMD_READ 则为 false） |
@@ -131,10 +131,13 @@ python3 -m ffcalc.burntool burn  plans/<uuid>.burn.json \
 - 外部读出 512 行（如 Kate 的方法）后存成行文件：每行 `<行号> <值>`（十进制或 `0x`，**未烧行必须写 0**，`#` 注释、dmesg 前缀可容忍），然后
   `python -m ffcalc mergeff cards/<uuid>.json ffrows.txt` 合并进快照，重跑 `scan`（或直接 `gen --ffrows ffrows.txt`）。`mergeff` 会报告覆盖是否完整，不完整继续拒绝。
 
+`mergeff` 对快照本身同样严格：合并前先校验快照中**已有**的每一行（行号 0–511、值为 32 位、同一行不得有两个值），任一不合格即 `FAIL:` 退出且**不写入任何字节**——否则无效行会被写回快照，直到 `gen` 才报错，错误位置与原因分离。保存是原子的：先写同目录临时文件、回读校验、再重命名覆盖，中途失败或磁盘满都不会让这张卡唯一的快照变成不完整的 JSON。若外部行文件与快照同行不同值，以现场读取值为准，并打印被覆盖的行（`note: … 222 0x….->0x….`）——若此前未做烧写，则说明该行的来源文件不属于这张卡。
+
 ## 退出码 / 常见消息速查
 
 | 消息 / 命令 | rc | 含义与下一步 |
 |---|---|---|
+| `FAIL: <快照路径>: …`（任何子命令，含 report/gen/mergeff/scan） | 2 | 快照不可信（行号越界、值超出 32 位、JSON 不完整、同一行两个值）。**文件未被修改**：按消息指出的键修正，或重新采集这张卡 |
 | `REFUSED: ff_rows is empty / covers only …`（gen） | 2 | FF 快照不全，**没有写出计划文件**；走「兜底路」 |
 | `SKIPPED (FF rows not read)`（scan 表格 plan 列） | 1 | 同上，dump 已保存，补 FF 行后重跑 |
 | `STILL partial: N of 265 FF rows unknown`（mergeff） | 1 | 行文件没列全（多半是没把未烧行写 0），补全再 merge |

@@ -1,17 +1,31 @@
+import contextlib
 import functools
+import glob
+import io
 import json
 import os
 import shutil
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 from ffcalc import capture, cli, ffmacro, ffrecord, ffrows, ingest
+from ffcalc import dump as snapshot
 from ffcalc.analyze import analyze
 from ffcalc.dump import load_dump
 from ffcalc.generate import plan
 from ffcalc.optionmap import BY_KEY
 from ffcalc.simulate import simulate
+
+
+def quiet(argv):
+    """Run one CLI command, returning (rc, stdout) -- failure messages are
+    part of the contract, so tests assert on them."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(list(argv))
+    return rc, buf.getvalue()
 
 
 def write_rows_file(dump, path):
@@ -209,6 +223,43 @@ class TestMergeffCli(unittest.TestCase):
         rc = cli.main(["gen", self.card, "-o",
                        os.path.join(self.tmp, "plan.json")])
         self.assertEqual(rc, 2)
+
+    def test_mergeff_over_capture_style_dump(self):
+        """mergeff over a capture snapshot: the rows it carries over are the
+        `"0x%08x"` strings `capture.py` wrote, and they survive the round trip.
+
+        `capture.py` writes row values as `"0x%08x"` strings, `ingest` writes
+        ints, and both are legal snapshots. An external rows file normally
+        covers only the FF region (222-486), so mergeff has to carry every row
+        outside it through unchanged. Carrying them through *unexamined* is
+        what crashed mergeff with `"0x%08x" % "0x00000000"` (real card,
+        2026-11-24); merely writing them back without checking is what would
+        push an invalid row into the snapshot to fail during `gen`, far from
+        the cause.
+        """
+        card = os.path.join(self.tmp, "capture-style.json")
+        outside = {0: 0x53557C3D, 1: 0x53557C3D, 221: 0x00000000}
+        with open(card, "w") as f:
+            json.dump({"sku": "8gb", "option_words": {},
+                       "ff_rows": dict(("%d" % r, "0x%08x" % v)
+                                       for r, v in outside.items())}, f)
+        self.assertEqual(cli.main(["gen", card, "-o",
+                                   os.path.join(self.tmp, "p.json")]), 2)
+        self.assertEqual(cli.main(["mergeff", card, self.rows]), 0)
+        self.assertEqual(cli.main(["gen", card, "-o",
+                                   os.path.join(self.tmp, "plan.json")]), 0)
+        # The invariant is not how the file looks but that loading it back
+        # gives the merged rows plus the rows that were already there, as-is.
+        rows = load_dump(card)["ff_rows"]
+        ff = dict((r, v) for r, v in self.dump["ff_rows"].items()
+                  if 222 <= r <= 486)
+        self.assertEqual(dict((r, rows[r]) for r in ff), ff)
+        self.assertEqual(dict((r, rows[r]) for r in outside), outside)
+        # Idempotent: the file mergeff wrote is a snapshot mergeff can read
+        # back, and merging the same readout again changes nothing.
+        before = open(card).read()
+        self.assertEqual(cli.main(["mergeff", card, self.rows]), 0)
+        self.assertEqual(open(card).read(), before)
 
     def test_sim_with_ffrows_option(self):
         self.assertEqual(cli.main(["mergeff", self.card, self.rows]), 0)
@@ -521,6 +572,186 @@ class TestIngest(unittest.TestCase):
                        "--dir", self._collect_dir(wrong),
                        "--ffrows", rows])
         self.assertEqual(rc, 1)
+
+
+class TestSnapshotCodec(unittest.TestCase):
+    """A snapshot is the only basis a burn plan is built from, so the codec
+    rules hold for every writer and every reader: any shape that can be a
+    real readout is believed exactly, anything that cannot is refused out loud
+    before a byte is written, and no failure may damage the file."""
+
+    INVALID_ROWS = [
+        ("row outside the array", {"999": "0x00000000"}),
+        ("negative row", {"-1": 0}),
+        ("value is not a number", {"222": "0xGG"}),
+        ("value is null", {"222": None}),
+        ("value is a bool", {"222": True}),
+        ("value is a float", {"222": 1.5}),
+        ("value wider than 32 bits", {"222": "0x1ffffffff"}),
+        ("same row listed twice with two values", {"222": 1, "0xde": 2}),
+        ("row key is not a number", {"ff222": 0}),
+    ]
+
+    FORMS = [("capture", lambda v: "0x%08x" % v),
+             ("probe", lambda v: v),
+             ("mixed", lambda v: "0x00000000" if v == 0 else v)]
+
+    def setUp(self):
+        self.dump = load_dump(SAMPLE)
+        self.tmp = tempfile.mkdtemp(prefix="ffcalc-snap-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.ff_rows = dict((r, v) for r, v in self.dump["ff_rows"].items()
+                            if ffrows.FF_ROW_MIN <= r <= ffrows.FF_ROW_MAX)
+        self.rows = write_rows_file(self.dump,
+                                    os.path.join(self.tmp, "rows.txt"))
+
+    def _card(self, rows, name="card.json"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            json.dump({"sku": "8gb", "option_words": {}, "ff_rows": rows}, f)
+        return path
+
+    def _disk_rows(self, path):
+        with open(path) as f:
+            return json.load(f)["ff_rows"]
+
+    def test_every_legal_shape_is_believed_exactly(self):
+        expected = {0: 0x53557C3D}                  # a row outside the FF region
+        expected.update(self.ff_rows)
+        for name, fmt in self.FORMS:
+            rows = dict(("%d" % r, fmt(v)) for r, v in sorted(expected.items()))
+            card = self._card(rows, "card-%s.json" % name)
+            self.assertEqual(load_dump(card)["ff_rows"], expected, name)
+            rc, out = quiet(["report", card])
+            self.assertEqual(rc, 0, (name, out))
+            rc, out = quiet(["mergeff", card, self.rows])
+            self.assertEqual(rc, 0, (name, out))
+            back = load_dump(card)["ff_rows"]
+            self.assertEqual(dict((r, back[r]) for r in self.ff_rows),
+                             self.ff_rows, name)
+            self.assertEqual(back[0], 0x53557C3D, name)
+
+    def test_invalid_rows_are_refused_before_anything_is_written(self):
+        for why, rows in self.INVALID_ROWS:
+            card = self._card(dict(rows))
+            before = open(card).read()
+            rc, out = quiet(["mergeff", card, self.rows])
+            self.assertEqual(rc, 2, (why, out))
+            self.assertIn("FAIL:", out, why)
+            self.assertEqual(open(card).read(), before,
+                             "%s: a refused merge must leave the snapshot "
+                             "exactly as it was" % why)
+            for cmd in (["report", card],
+                        ["gen", card, "-o", os.path.join(self.tmp, "p.json")]):
+                rc, out = quiet(cmd)
+                self.assertEqual(rc, 2, (why, cmd[0], out))
+                self.assertIn("FAIL:", out, "%s: %s" % (why, cmd[0]))
+            self.assertEqual(glob.glob(os.path.join(self.tmp, "*.tmp")), [])
+
+    def test_missing_file_is_a_message_not_a_traceback(self):
+        rc, out = quiet(["report", os.path.join(self.tmp, "nope.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("FAIL:", out)
+        self.assertIn("cannot be read", out)
+
+    def test_plan_file_that_is_not_a_plan_is_refused(self):
+        """A plan is a burn order: a truncated or foreign file must be
+        refused with a message (rc 2), not a traceback -- `sim` and `verify`
+        are what stand between a plan file and burntool."""
+        card = self._card(dict(("%d" % r, "0x%08x" % v)
+                               for r, v in sorted(self.ff_rows.items())))
+        plan_path = os.path.join(self.tmp, "plan.json")
+        self.assertEqual(quiet(["gen", card, "-o", plan_path])[0], 0)
+        good = open(plan_path).read()
+        cases = {"truncated": good[:len(good) // 2],
+                 "not a plan": '{"burn": "no"}'}
+        for why, body in cases.items():
+            with open(plan_path, "w") as f:
+                f.write(body)
+            for cmd in (["sim", card, plan_path],
+                        ["verify", plan_path, "--dump", card]):
+                rc, out = quiet(cmd)
+                self.assertEqual(rc, 2, (why, cmd[0], out))
+                self.assertIn("FAIL:", out, (why, cmd[0]))
+        with open(plan_path, "w") as f:
+            f.write(good)
+
+    def test_bad_rows_file_names_the_line_that_broke(self):
+        path = os.path.join(self.tmp, "rows-bad.txt")
+        with open(path, "w") as f:
+            f.write("222 0x0fe805c1\n999 0\n")
+        rc, out = quiet(["mergeff", self._card({}), path])
+        self.assertEqual(rc, 2)
+        self.assertIn("line 2", out)
+
+    def test_truncated_snapshot_says_so_instead_of_raising(self):
+        # What an interrupted, non-atomic write by an older ffcalc leaves
+        # behind -- the fix is re-capturing, so say that, not "JSONDecodeError".
+        path = os.path.join(self.tmp, "truncated.json")
+        with open(path, "w") as f:
+            f.write('{"sku": "8gb", "ff_rows": {"222": "0x0f')
+        for cmd in (["report", path], ["mergeff", path, self.rows]):
+            rc, out = quiet(cmd)
+            self.assertEqual(rc, 2, (cmd[0], out))
+            self.assertIn("not valid JSON", out)
+
+    def test_mergeff_shows_which_rows_it_overwrote(self):
+        rows = dict(("%d" % r, "0x%08x" % v)
+                    for r, v in sorted(self.ff_rows.items()))
+        rows["222"] = "0xdeadbeef"          # snapshot disagrees with the readout
+        card = self._card(rows)
+        rc, out = quiet(["mergeff", card, self.rows])
+        self.assertEqual(rc, 0)
+        self.assertIn("note:", out)
+        self.assertIn("222 0xdeadbeef->0x%08x" % self.ff_rows[222], out)
+        # the live readout wins: that is the whole point of merging one in
+        self.assertEqual(load_dump(card)["ff_rows"][222], self.ff_rows[222])
+
+    def test_write_failure_keeps_the_snapshot_that_was_there(self):
+        card = self._card(dict(("%d" % r, "0x%08x" % v)
+                               for r, v in sorted(self.ff_rows.items())))
+        good = open(card).read()
+        for where, exc in (("os.replace", OSError(28, "No space left on device")),
+                           ("json.dumps", TypeError("not serializable"))):
+            with mock.patch("ffcalc.dump." + where, side_effect=exc):
+                rc, out = quiet(["mergeff", card, self.rows])
+            self.assertEqual(rc, 2, (where, out))
+            self.assertIn("FAIL:", out, where)
+            self.assertEqual(open(card).read(), good,
+                             "%s: a failed write must leave the old snapshot"
+                             % where)
+            self.assertFalse(os.path.exists(card + ".tmp"),
+                             "%s: the temp file must not be left behind" % where)
+
+    def test_coverage_refuses_a_key_that_is_not_a_row(self):
+        # coverage() is the gate that decides "burn or not", so a key that is
+        # not a physical row must not quietly read as "some rows are known":
+        # that is how a corrupt snapshot could look "partial" instead of bad.
+        for rows in ({"999": "0x00000000", "222": 0},
+                     {"ff222": 0},
+                     {"-3": 0}):
+            self.assertRaises(snapshot.BadSnapshot, ffrows.coverage,
+                              {"ff_rows": rows})
+
+    def test_both_writer_channels_emit_one_shape(self):
+        """Whatever a dump looked like in memory, both writers put the same
+        canonical rows on disk: probe saves through ingest.save_dump, capture
+        through to_json_form + atomic_write_json, and neither passes an int
+        value through for the next reader to trip over."""
+        mem = {"sku": "8gb", "ff_rows": dict(self.ff_rows),
+               "option_words": {"fbp_disable": 0x852}}
+        via_probe = ingest.save_dump(os.path.join(self.tmp, "cards"), mem)
+        via_capture = os.path.join(self.tmp, "capture.json")
+        snapshot.atomic_write_json(via_capture,
+                                   snapshot.to_json_form(mem, via_capture))
+        self.assertEqual(self._disk_rows(via_probe),
+                         self._disk_rows(via_capture))
+        for path in (via_probe, via_capture):
+            self.assertTrue(all(isinstance(v, str) and len(v) == 10
+                                for v in self._disk_rows(path).values()), path)
+            self.assertEqual(load_dump(path)["ff_rows"],
+                             dict((r, v) for r, v in
+                                  load_dump(via_probe)["ff_rows"].items()))
 
 
 if __name__ == "__main__":

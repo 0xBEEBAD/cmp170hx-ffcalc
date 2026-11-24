@@ -1,12 +1,11 @@
 import argparse
-import io
-import json
 import os
 import sys
 
 from . import ffrows, ingest
 from .analyze import analyze
-from .dump import load_dump
+from .dump import (BadSnapshot, atomic_write_json, load_dump, load_plan,
+                   update_rows)
 from .generate import plan
 from .optionmap import BY_KEY, FF_ROW_MAX, FF_ROW_MIN
 from .simulate import simulate
@@ -22,17 +21,31 @@ def _apply_ffrows_option(dump, path):
 
 
 def _write_dump_ffrows(dump_path, rows):
-    """Update only ff_rows in a saved card JSON, preserving other fields."""
-    with io.open(dump_path, encoding="utf-8") as f:
-        raw = json.load(f)
-    merged = dict((int(k, 0), v) for k, v in (raw.get("ff_rows") or {}).items())
-    for row, value in sorted(rows.items()):
-        merged[row] = value
-    raw["ff_rows"] = dict(("%d" % r, "0x%08x" % v)
-                          for r, v in sorted(merged.items()))
-    with io.open(dump_path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2, sort_keys=True)
-    return ffrows.coverage({"ff_rows": merged})
+    """Merge an externally-read FF rows file into a saved card JSON in place.
+
+    Whatever the snapshot already holds is re-checked and re-normalised on
+    the way, not carried over unexamined: the probe channel writes ints and
+    the capture channel writes `"0x%08x"` strings (both are legal snapshots),
+    while an external rows file usually covers only the FF region, so rows
+    from outside it have to survive the round trip in whatever shape they
+    were written in. Passing them through blind is what crashed mergeff on a
+    capture snapshot (`"0x%08x" % "0x00000000"`, real card 2026-11-24); not
+    checking them is what would write a row 999 or a 33-bit value back into
+    the file and then crash `gen`, far from the cause. BadSnapshot comes out
+    of here and the file is left untouched.
+
+    Returns (state, missing, conflicts).
+    """
+    merged, conflicts = update_rows(dump_path, rows)
+    return ffrows.coverage({"ff_rows": merged}) + (conflicts,)
+
+
+def _fmt_conflicts(conflicts, limit=6):
+    parts = ["%d 0x%08x->0x%08x" % (row, old, new)
+             for row, old, new in conflicts[:limit]]
+    if len(conflicts) > limit:
+        parts.append("...(+%d)" % (len(conflicts) - limit))
+    return ",".join(parts)
 
 
 def _parse_sets(pairs):
@@ -83,7 +96,7 @@ def _print_analysis(rep):
         print("  WARN: %s" % msg)
 
 
-def main(argv=None):
+def _dispatch(argv=None):
     ap = argparse.ArgumentParser(prog="ffcalc",
                                  description="GA100 CMP 170HX FF fuse tool")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -153,8 +166,14 @@ def main(argv=None):
         except ValueError as e:
             print("FAIL: bad FF rows file %s: %s" % (args.rows, e))
             return 2
-        state, missing = _write_dump_ffrows(args.dump, rows)
+        state, missing, conflicts = _write_dump_ffrows(args.dump, rows)
         print("merged %d FF row(s) into %s" % (len(rows), args.dump))
+        if conflicts:
+            print("note: %d row(s) already in the snapshot held a different "
+                  "value and were overwritten by this readout: %s"
+                  % (len(conflicts), _fmt_conflicts(conflicts)))
+            print("note: unless this card was burnt since the snapshot, "
+                  "check this rows file really came from this card")
         if state == "complete":
             print("FF rows %d-%d fully covered; burn plan available: "
                   "ffcalc gen %s -o plans/<uuid>.burn.json"
@@ -181,8 +200,9 @@ def main(argv=None):
             print("how to fix: %s" % ffrows.GUIDANCE)
             print("no burn plan was written to %s" % args.out)
             return 2
-        with io.open(args.out, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2, sort_keys=True)
+        # Atomic: a half-written plan is worse than no plan, because whoever
+        # reads that filename next takes it for a burn order.
+        atomic_write_json(args.out, obj)
         print("card: %s  fingerprint: %s"
               % (dump.get("uuid") or "none (no nvidia-smi data)",
                  dump.get("fingerprint")))
@@ -201,8 +221,7 @@ def main(argv=None):
         dump = load_dump(args.dump)
         if args.ffrows:
             _apply_ffrows_option(dump, args.ffrows)
-        with io.open(args.burn, encoding="utf-8") as f:
-            burn_obj = json.load(f)
+        burn_obj = load_plan(args.burn)
         res = simulate(dump, burn_obj)
         print("%-24s %-9s %-8s %-10s %-10s" %
               ("key", "chain/bit", "before", "after", "status"))
@@ -251,8 +270,7 @@ def main(argv=None):
                         os.makedirs(args.plans)
                     ppath = os.path.join(args.plans,
                                          ingest.card_id(dump) + ".burn.json")
-                    with io.open(ppath, "w", encoding="utf-8") as f:
-                        json.dump(obj, f, indent=2, sort_keys=True)
+                    atomic_write_json(ppath, obj)
                     pinfo = "%s (%d records)" % (ppath, len(obj["burn"]))
             rows.append((dump, rep, pinfo))
         if not rows:
@@ -284,8 +302,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "verify":
-        with io.open(args.burn, encoding="utf-8") as f:
-            burn_obj = json.load(f)
+        burn_obj = load_plan(args.burn)
         puuid, pfp = burn_obj.get("uuid"), burn_obj.get("fingerprint")
         if not puuid and not pfp:
             print("FAIL: plan has no uuid/fingerprint; re-generate it")
@@ -327,6 +344,21 @@ def main(argv=None):
         return 1 if res["errors"] else 0
 
     return 2
+
+
+def main(argv=None):
+    """Run one command.
+
+    A snapshot that cannot be trusted prints ``FAIL: <what and where>`` and
+    exits 2 instead of raising: these files are read by hand, edited by hand
+    and are the only thing a burn plan is derived from, so the answer is
+    either "believed" or "refused out loud", never a Python traceback.
+    """
+    try:
+        return _dispatch(argv)
+    except BadSnapshot as e:
+        print("FAIL: %s" % e)
+        return 2
 
 
 if __name__ == "__main__":

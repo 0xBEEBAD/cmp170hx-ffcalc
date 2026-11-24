@@ -17,6 +17,8 @@ import json
 import os
 import re
 
+from . import dump as snapshot
+
 LINE = re.compile(r"FFPROBE (\S+) ([0-9a-fA-F]+) ([0-9a-fA-F]+)")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,9 +132,12 @@ def card_id(dump):
 
 
 def save_dump(outdir, dump):
+    """Write cards/<id>.json through the snapshot codec: every value checked,
+    one on-disk shape, and the file renamed into place only after it has been
+    read back, so an interrupted scan cannot leave a card without a
+    snapshot."""
     if not os.path.isdir(outdir):
         os.makedirs(outdir)
     path = os.path.join(outdir, card_id(dump) + ".json")
-    with io.open(path, "w", encoding="utf-8") as f:
-        json.dump(dump, f, indent=2, sort_keys=True)
+    snapshot.atomic_write_json(path, snapshot.to_json_form(dump, path))
     return path

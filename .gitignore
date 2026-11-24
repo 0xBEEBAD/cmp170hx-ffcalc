@@ -4,3 +4,5 @@ collected/
 cards/
 plans/
 temp/
+# atomic snapshot/plan writes rename a sibling temp into place
+*.json.tmp

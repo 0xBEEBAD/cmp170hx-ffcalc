@@ -19,14 +19,30 @@ cold-boot before any further access. See docs/BURNING.md.
 """
 import argparse
 import functools
-import io
-import json
 import sys
 
 from . import ffmacro
 from .capture import open_bar0, rd as _rd, wr as _wr
-from .dump import load_dump
+from .dump import BadSnapshot, load_dump, load_plan
 from .simulate import simulate
+
+
+def _load_pair(plan_path, dump_path, log):
+    """(plan, dump) or None after a REFUSED line.
+
+    Both files are load-bearing: the snapshot is what every row is re-read
+    against before an irreversible burn, so an unreadable or truncated one
+    means "do not touch the card" -- said out loud, not as a Python
+    traceback in front of somebody holding a live card. BadPlan is a
+    BadSnapshot, so one handler covers both files.
+    """
+    try:
+        plan = load_plan(plan_path)
+        dump = load_dump(dump_path)
+    except BadSnapshot as e:
+        log("REFUSED: %s" % e)
+        return None
+    return plan, dump
 
 
 def cmd_status(rd, log=print):
@@ -43,9 +59,10 @@ def cmd_status(rd, log=print):
 
 def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
              sleep=None, clock=None, force=False):
-    with io.open(plan_path, encoding="utf-8") as f:
-        plan = json.load(f)
-    dump = load_dump(dump_path)
+    loaded = _load_pair(plan_path, dump_path, log)
+    if loaded is None:
+        return 1
+    plan, dump = loaded
     res = simulate(dump, plan)
     for w in res["warnings"]:
         log("warn: %s" % w)

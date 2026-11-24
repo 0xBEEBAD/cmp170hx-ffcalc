@@ -1,13 +1,14 @@
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ffcalc import ffmacro
-from ffcalc import burntool
+from ffcalc import burntool, cli, ffmacro
+from ffcalc.dump import load_dump
 
 
 class BurnBar(object):
@@ -208,6 +209,87 @@ class TestBurnTool(unittest.TestCase):
         rc = burntool.cmd_burn(bar.rd, bar.wr, self.plan_path,
                                self.dump_path, log=lambda *_: None)
         self.assertEqual(rc, 3)
+
+    def test_untrusted_snapshot_refuses_without_touching_the_card(self):
+        """Whatever is wrong with the snapshot, the answer is a REFUSED line
+        and no command to the controller: an unreadable snapshot is not
+        permission to burn, and the operator must not be left reading a
+        traceback with the card already sitting in the write window."""
+        cases = {
+            "row outside the array": '{"sku": "8gb", "ff_rows": {"999": 0}}',
+            "value wider than 32 bits":
+                '{"sku": "8gb", "ff_rows": {"222": "0x1ffffffff"}}',
+            "truncated by an interrupted write":
+                '{"sku": "8gb", "ff_rows": {"222": "0x0f',
+        }
+        for why, body in cases.items():
+            with open(self.dump_path, "w") as f:
+                f.write(body)
+            bar = BurnBar(rows={290: 0x429004C1})
+            logs = []
+            rc = burntool.cmd_burn(bar.rd, bar.wr, self.plan_path,
+                                   self.dump_path, sleep=noop,
+                                   clock=zero_clock, log=logs.append)
+            self.assertEqual(rc, 1, (why, logs))
+            self.assertTrue(any("REFUSED" in line for line in logs), (why, logs))
+            self.assertEqual(bar.programs, [], why)
+            self.assertEqual(bar.addr, 0,
+                             "%s: not even a row address was written" % why)
+
+    def test_plan_that_is_not_a_plan_refuses(self):
+        with open(self.plan_path, "w") as f:
+            json.dump({"burn": "not a list"}, f)
+        bar = BurnBar(rows={290: 0x429004C1})
+        logs = []
+        rc = burntool.cmd_burn(bar.rd, bar.wr, self.plan_path, self.dump_path,
+                               log=logs.append)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("not a burn plan" in line for line in logs), logs)
+        self.assertEqual(bar.programs, [])
+
+
+class TestCaptureSnapshotEndToEnd(unittest.TestCase):
+    """The whole fallback path over a capture-style snapshot -- the shape
+    mergeff used to crash on: rows read out elsewhere -> mergeff -> gen -> sim
+    -> burntool re-reading every planned row off the card."""
+
+    SAMPLE = os.path.join(os.path.dirname(__file__), "..",
+                          "samples", "blog_card_example.json")
+
+    def test_readout_to_burn(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        base = load_dump(self.SAMPLE)
+        ff = dict((r, v) for r, v in base["ff_rows"].items()
+                  if 222 <= r <= 486)
+        card = os.path.join(tmp, "card.json")
+        rows = dict(("%d" % r, "0x%08x" % v) for r, v in sorted(ff.items()))
+        for r in range(222):        # a capture lists the whole array, so the
+            rows.setdefault("%d" % r, "0x00000000")    # rows outside FF are strings
+        with open(card, "w") as f:
+            json.dump({"sku": "8gb", "uuid": "GPU-e2e", "fingerprint": "e2e",
+                       "ff_rows": rows,
+                       "option_words": dict((k, "0x%x" % v) for k, v
+                                            in base["option_words"].items())}, f)
+        rows_file = os.path.join(tmp, "ffrows.txt")
+        with open(rows_file, "w") as f:
+            for r, v in sorted(ff.items()):
+                f.write("%d %s\n" % (r, v))
+        plan_path = os.path.join(tmp, "plan.json")
+        self.assertEqual(cli.main(["mergeff", card, rows_file]), 0)
+        self.assertEqual(cli.main(["gen", card, "-o", plan_path]), 0)
+        self.assertEqual(cli.main(["sim", card, plan_path]), 0)
+        with open(plan_path) as f:
+            planned = json.load(f)["burn"]
+        self.assertTrue(planned)
+        bar = BurnBar(rows=dict(load_dump(card)["ff_rows"]))
+        bar.reg[ffmacro.SBFE_SHADOW] = 0
+        bar.reg[ffmacro.WDATA_WR_SECURE] = 0
+        rc = burntool.cmd_burn(bar.rd, bar.wr, plan_path, card, sleep=noop,
+                               clock=zero_clock, log=lambda *_: None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(bar.programs,
+                         [(rec["row"], int(rec["record"], 0)) for rec in planned])
 
 
 if __name__ == "__main__":

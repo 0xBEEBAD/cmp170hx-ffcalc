@@ -5,8 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ffcalc import ffrecord
-from ffcalc.optionmap import BY_KEY, set_bits
+from ffcalc import dump as snapshot, ffrecord
+from ffcalc.optionmap import BY_KEY, FF_ROW_MAX, FF_ROW_MIN, set_bits
 
 EFFECTIVE = {
     "fbio_disable": 0x000000,
@@ -56,34 +56,32 @@ PCIE_EFFECTIVE = {
 
 
 def build_rows(values):
+    """FF records keyed by physical row, values as ints; the snapshot codec
+    decides how they are written out."""
     blocks = {}
     for key, value in values.items():
         f = BY_KEY[key]
         set_bits(blocks.setdefault(f.chain, {}), f.bit, f.width, value)
     rows = {}
-    row = 222
+    row = FF_ROW_MIN
     for chain in sorted(blocks):
         for blk in sorted(blocks[chain]):
-            rows[row] = "0x%08x" % ffrecord.encode(
-                chain, blk, blocks[chain][blk])
+            rows[row] = ffrecord.encode(chain, blk, blocks[chain][blk])
             row += 1
     return rows
-
-
-FF_ROW_MIN, FF_ROW_MAX = 222, 486
 
 
 def main():
     rows = build_rows(dict(EFFECTIVE, **PCIE_EFFECTIVE))
     # A real readout lists every FF row; unburnt rows read back as 0.
     for r in range(FF_ROW_MIN, FF_ROW_MAX + 1):
-        rows.setdefault(r, "0x00000000")
+        rows.setdefault(r, 0)
     dump = {
         "sku": "8gb",
         "comment": "synthetic dump modeled on kate-land blog card "
                    "(FBP_DISABLE=0x852, FBP_DEFECTIVE=0x840); FF region "
                    "fully listed, unburnt rows = 0",
-        "ff_rows": rows,
+        "ff_rows": snapshot.serialize_rows(rows),
         "option_words": dict(EFFECTIVE, **DEFECTIVE),
     }
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -91,9 +89,9 @@ def main():
     with io.open(out, "w", encoding="utf-8") as f:
         json.dump(dump, f, indent=2, sort_keys=True)
     print(out)
-    for r in sorted(rows, key=lambda x: int(x)):
-        if int(rows[r], 0):
-            print("  row %s = %s" % (r, rows[r]))
+    for r in sorted(rows):
+        if rows[r]:
+            print("  row %d = 0x%08x" % (r, rows[r]))
 
 
 if __name__ == "__main__":
