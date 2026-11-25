@@ -1,5 +1,5 @@
 {
-  "note": "GA100 BAR0 fuse readout map, vendored from community research (kate-land/ga100vfi gpu0-capture data + GA100 public headers). Addresses only; no code dependency.",
+  "note": "GA100 BAR0 fuse readout map, vendored from community research (kate-land/ga100vfi gpu0-capture data + GA100 public headers). Addresses only; no code dependency. `info` holds read-only state words; the STATUS_OPT_* ones are what prove a media engine is physically present, because hardware computes STATUS_OPT_* = OPT_DISABLE | OPT_DEFECTIVE (so STATUS == OPT means zero defects) and there is no *_DEFECTIVE register for NVDEC/NVJPG/OFA. dsov_status (0x820084) is the word ffmacro checks as DSOV_STATUS when deciding whether the card is inside a burn window; community floorsweep reports name the same word FUSE_DIS_SW_OVR. Together with en_sw_override (0x820040) they say whether the CTRL_OPT_* software-override route is alive at all: on datacenter GA100 it is not (0 / DSOV asserted outside the window), so the FF pool is the only lever.",
   "fields": {
     "fbio_disable": { "fused": "0x0082036c", "status": "0x00820c14" },
     "fbpa_disable": { "fused": "0x00820368", "status": "0x00820c18" },
@@ -47,12 +47,19 @@
   },
   "info": {
     "secured_burn_feature_enable": "0x00821108",
+    "en_sw_override": "0x00820040",
+    "dsov_status": "0x00820084",
     "nvdec_disable": "0x00820378",
+    "nvjpg_disable": "0x00820370",
+    "ofa_disable": "0x008202d8",
     "status_fb_config": "0x00820c34",
     "status_half_fbpa": "0x00820c00",
     "status_half_ltc": "0x00820c10",
     "status_nvdec": "0x00820c24",
     "status_nvjpg": "0x00820c0c",
+    "status_ofa": "0x00820e34",
+    "status_display": "0x00820c04",
+    "status_disp_head": "0x00820c08",
     "status_pcie_lane": "0x00820c2c"
   }
 }

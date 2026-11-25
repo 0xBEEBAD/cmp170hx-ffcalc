@@ -1,8 +1,8 @@
 from . import ffrecord, ffrows
 from .analyze import analyze, replay_blocks, used_ff_rows
 from .optionmap import (A100_DEVID, A100_MAGIC_D, CMP_DEVID, DEVID_KEYS,
-                        FIELDS, FF_ROW_MAX, FF_ROW_MIN, block_mask, get_bits,
-                        set_bits)
+                        ENGINE_KEYS, ENGINE_PAIR_KEYS, FIELDS, FF_ROW_MAX,
+                        FF_ROW_MIN, block_mask, get_bits, set_bits)
 
 # What the fused-device-id rewrite means, said out loud in every plan that
 # carries it: it is the one burn that changes what the card *is*, and it drags
@@ -53,13 +53,57 @@ A100_MAGIC_WARNING = (
 )
 
 
-def plan(dump, only=None, skip=(), overrides=None, a100=False):
+# --mig clears the Chain-1 floorsweep bits on the media engines. Everything the
+# operator needs in order to agree to those rows, in the order the questions
+# come: what the bits are, what comes out of burning them, and what this does
+# not prove. The row cost is not asserted here -- it depends on which blocks
+# this card's plan already rewrites, so it is computed per plan and appended
+# below. The long version is in README ("媒体引擎与 MIG 解锁（--mig）").
+MIG_WARNINGS = (
+    "nvdec_disable/nvjpg_ofa_disable_bit146/bit371: these are Chain-1 (TOP_FS) "
+    "floorsweep bits, not a driver check for 10de:20c2 and not a VBIOS lock. "
+    "That the units are really here is read out, not assumed: this snapshot has "
+    "STATUS_OPT_* == OPT_DISABLE for them, and hardware computes STATUS_OPT = "
+    "OPT_DISABLE | OPT_DEFECTIVE, so that equality means every unit exists with "
+    "no defects (on the community card the same clear made every NVDEC/NVJPG/"
+    "OFA slot show up in NV_PTOP_DEVICE_INFO2). The cheap software route is dead "
+    "on datacenter GA100: FUSE_EN_SW_OVERRIDE (0x820040) = 0, and the community "
+    "checks found that volatile writes to the override/option words "
+    "(CTRL_OPT_NVJPG 0x82080c, CTRL_OPT_NVDEC 0x820824, CTRL_OPT_SYS_PIPE "
+    "0x820a30, OPT_NVDEC_DISABLE 0x820378, OPT_SYS_PIPE_DISABLE 0x8203a4) never "
+    "moved STATUS_OPT_*, even inside Goldilocks. Burning an FF record is the "
+    "only lever",
+    "what this buys: 5x NVDEC hardware decode (H264/HEVC/VP9/MPEG2/JPEG; no "
+    "AV1, GA100's NVDEC predates the GA10x AV1 block), NVJPG0 hardware JPEG "
+    "decode, OFA0 optical flow (NvOF API 5.0), and real multi-instance MIG -- "
+    "with sys_pipe_disable=0, which the default plan already burns, the 8 "
+    "SYS_PIPEs give 8g/4g/2g/1g profiles instead of the single non-"
+    "partitionable 1g that un-burnt cards show. A retail A100 stops at 7g "
+    "because one of its GPCs is floorswept",
+    "what this does NOT prove: which of bit146/bit371 is NVJPG and which is "
+    "OFA (both are cleared, as with the two unresolved DISABLE_GEN3_SPEED "
+    "bits; separating them takes a bus reset between the two rows on a second "
+    "card), and nothing here touches ECC. AV1 is architecturally absent, not "
+    "fuse-gated. The functional side (5/5 concurrent CUVID sessions, "
+    "nvjpegDecode HARDWARE, NvOF API 5.0, 8-way `mig -lgip`) comes from an "
+    "external card report -- nothing on THIS card has run it yet. After "
+    "toggling MIG mode (`nvidia-smi -mig 1/-mig 0`) REBOOT before using MIG: "
+    "the in-driver FLR resets the FB geometry back to 8192 MiB until "
+    "gpu_unlock restores it from initramfs, and live slices silently shrink to "
+    "1g.1gb",
+)
+
+
+def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False):
     # Without a complete FF-row snapshot we cannot know which rows are
     # occupied or what the current block values are; refuse rather than
     # append records onto already-burnt rows.
     ffrows.require(dump, "generate a burn plan")
     only = set(only) if only else None
     skip = set(skip)
+    # --a100/--mig add targets below; copy first so a caller's dict (and a
+    # re-used overrides dict) is never rewritten by planning a card.
+    overrides = dict(overrides or {})
     if a100:
         # Community-reported path: the boot gate that refuses an A100 vBIOS
         # compares the *fused* device id with the rom's, so the conversion
@@ -75,12 +119,20 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False):
         # --skip/--only are respected here, not just downstream: a target named
         # without any record behind it would leave `sim` reporting an unfilled
         # target for a field this plan was told to leave alone.
-        overrides = dict(overrides or {})
         for key in DEVID_KEYS + ("magic_d",):
             if key in skip or (only is not None and key not in only):
                 continue
             overrides.setdefault(key, A100_MAGIC_D if key == "magic_d"
                                  else A100_DEVID)
+    if mig:
+        # The media-engine floorsweep bits (chain1 blk8[15:11], blk9[2],
+        # blk23[3]). Nothing else in this tool touches them, and without a
+        # STATUS_OPT_* readout resolve_targets() refuses them outright: see
+        # MIG_WARNINGS and the field comments in optionmap.py.
+        for key in ENGINE_KEYS:
+            if key in skip or (only is not None and key not in only):
+                continue
+            overrides.setdefault(key, 0)
     rep = analyze(dump, overrides)
     targets = rep["targets"]
     warnings = list(rep["warnings"])
@@ -88,6 +140,12 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False):
 
     base = {c: dict(b) for c, b in replay_blocks(dump).items()}
     pending = {c: dict(b) for c, b in base.items()}
+    # The same replay with the media-engine bits left alone: what this plan
+    # would have written anyway. `--mig` costs a row only where it changes a
+    # block this baseline does not already touch, which is the difference
+    # between "clearing NVDEC is free" (chain1 blk8 is being rewritten for
+    # gpc/fbpa regardless) and "clearing NVDEC costs a row".
+    baseline = {c: dict(b) for c, b in base.items()}
     selected = []
 
     for f in FIELDS:
@@ -100,7 +158,16 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False):
         if cur == tgt:
             continue
         set_bits(pending.setdefault(f.chain, {}), f.bit, f.width, tgt)
+        if f.key not in ENGINE_KEYS:
+            set_bits(baseline.setdefault(f.chain, {}), f.bit, f.width, tgt)
         selected.append(f)
+
+    def touched(state):
+        return set((chain, blk) for chain, blocks in state.items()
+                   for blk, value in blocks.items()
+                   if value != base.get(chain, {}).get(blk, 0))
+
+    extra_rows = sorted(touched(pending) - touched(baseline))
 
     used = set(used_ff_rows(dump))
     next_row = (max(used) + 1) if used else FF_ROW_MIN
@@ -156,6 +223,59 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False):
         warnings.append(A100_MAGIC_WARNING % (targets["magic_d"],
                                              A100_MAGIC_D))
 
+    # Same reasoning for the media-engine rows: the plan file is a burn order,
+    # and these three bits are the only ones in here whose payoff is not
+    # already visible in the FB/SM numbers above.
+    engines_in_plan = [key for key in ENGINE_KEYS if key in in_plan]
+    if engines_in_plan:
+        warnings.extend(MIG_WARNINGS)
+        # "Free" only means "rides in a block this plan already rewrites", and
+        # whether that happens is a property of THIS plan: on a card whose
+        # capability records are burnt already, chain1 blk8/blk23 hold nothing
+        # else and every engine bit has to carry its own row. Measured on our
+        # own two cards, both already unlocked: 3 rows, not the 1 a fresh card
+        # taking the whole default plan in one round pays.
+        engine_blocks = set((f.chain, f.bit // 16) for f in FIELDS
+                            if f.key in ENGINE_KEYS and f.key in in_plan)
+        free = sorted(engine_blocks & touched(baseline))
+        if extra_rows:
+            msg = ("row cost of --mig on this card: %d extra FF row(s) (%s)"
+                   % (len(extra_rows),
+                      ", ".join("chain%d blk%d" % t for t in extra_rows)))
+            if free:
+                warnings.append(
+                    msg + "; the rest rode along in %s, blocks this plan "
+                    "rewrites anyway" % ", ".join(
+                        "chain%d blk%d" % t for t in free))
+            else:
+                warnings.append(
+                    msg + ": nothing else in this plan touches those blocks, so "
+                    "each engine bit carries its own row. That is the price of "
+                    "a later add-on round -- FF rows are finite and every "
+                    "already-written block has to be rewritten, which is why "
+                    "clearing these bits in the same round as the capability "
+                    "records is the cheap moment")
+        else:
+            warnings.append(
+                "row cost of --mig on this card: 0 extra rows, every engine bit "
+                "here sits in a block the plan already rewrites")
+        pair = [key for key in ENGINE_PAIR_KEYS if key in in_plan]
+        if len(pair) == 1:
+            warnings.append(
+                "only %s of the NVJPG/OFA pair is being cleared: which engine "
+                "comes out depends on which one that bit belongs to, and that "
+                "mapping is exactly the part nobody has separated yet -- "
+                "clearing both together is what the community card did and the "
+                "only combination with a functional proof behind it"
+                % pair[0])
+        if targets.get("sys_pipe_disable"):
+            warnings.append(
+                "8-way MIG also needs sys_pipe_disable=0, which this plan "
+                "leaves at 0x%x: with one SYS_PIPE, MIG stays a single "
+                "non-partitionable 1g instance, so the DEC/JPEG/OFA units "
+                "cleared here stay unreachable from any slice"
+                % targets["sys_pipe_disable"])
+
     return {
         "sku": dump["sku"],
         "source": dump["source"],
@@ -166,6 +286,10 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False):
         "analysis": {
             "usable_fbp": rep["usable_fbp"], "fb_gib": rep["fb_gib"],
             "sm_count": rep["sm_count"], "sm_per_gpc": rep["sm_per_gpc"],
+            # Whole media/MIG block, same shape `report` prints: which engines
+            # are live now and after this plan, what the OPT/STATUS readout
+            # proved, and whether the software override route was even alive.
+            "media": rep["media"],
             "nvlink_ok": rep["nvlink_ok"], "pcie_gen4_ok": rep["pcie_gen4_ok"],
         },
         "warnings": warnings,

@@ -7,7 +7,8 @@ from .analyze import analyze
 from .dump import (BadSnapshot, atomic_write_json, load_dump, load_plan,
                    update_rows)
 from .generate import plan
-from .optionmap import BY_KEY, DEVID_KEYS, FF_ROW_MAX, FF_ROW_MIN
+from .optionmap import (BY_KEY, DEVID_KEYS, FF_ROW_MAX, FF_ROW_MIN,
+                        TOTAL_SYS_PIPE)
 from .simulate import simulate
 
 
@@ -92,9 +93,69 @@ def _print_analysis(rep):
         "  (needs U11 bridge mod + ROM check bypass)" if nv else ""))
     print("  PCIe Gen3/4: %s" % ("bits clearable" if rep["pcie_gen4_ok"]
                                  else "stays restricted"))
+    _print_media(rep)
     _print_devid(rep)
     for msg in rep["warnings"]:
         print("  WARN: %s" % msg)
+
+
+def _print_media(rep):
+    """MIG and the media engines: what is live now, what this plan makes it,
+    and what the readout can and cannot prove about it.
+
+    Kept separate from the other unlocks because the evidence is different:
+    these engines have no ``*_DEFECTIVE`` word, so ``STATUS_OPT_*`` (which
+    hardware computes as OPT | DEFECTIVE) is what says whether a row spent on
+    them unlocks real silicon, and without that readout the plan skips them.
+    """
+    media = rep.get("media") or {}
+    mig, engines = media.get("mig", {}), media.get("engines", [])
+    print("\n[MIG / media engines]")
+    if mig.get("read") and mig.get("after") is not None:
+        print("  MIG SYS_PIPE: %d/%d live now -> %d/%d after this plan "
+              "(sys_pipe_defective=0x%02x; 1 pipe = MIG offers one "
+              "non-partitionable 1g profile)"
+              % (mig["now"], TOTAL_SYS_PIPE, mig["after"], TOTAL_SYS_PIPE,
+                 mig["defective"]))
+    else:
+        print("  MIG SYS_PIPE: not read")
+    for e in engines:
+        if not e["read"]:
+            print("  %-6s not read by this snapshot (the readout map grew): "
+                  "cannot prove the units are defect-free -> no row planned"
+                  % e["label"])
+            continue
+        verdict = ("no defects: STATUS == OPT_DISABLE" if not e["defective"]
+                   else "DEFECTIVE 0x%x: those units no fuse can create"
+                        % e["defective"])
+        print("  %-6s %d/%d live now -> %s after this plan "
+              "(OPT=0x%x STATUS=0x%x: %s)%s"
+              % (e["label"], e["now"], e["total"],
+                 ("%d/%d" % (e["after"], e["total"])) if e["planned"]
+                 else "unchanged",
+                 e["opt"], e["status"], verdict,
+                 "" if e["planned"] else "  [not in this plan: --mig]"))
+    if any(not e["planned"] for e in engines):
+        print("  gates: NVDEC = chain1 blk8[15:11], NVJPG/OFA pair = blk9[2] + "
+              "blk23[3] (which bit is which engine is not separated, so both "
+              "go together). Row cost depends on whether this plan is already "
+              "rewriting those blocks -- on a fresh card taking the default "
+              "plan they ride along and only blk9 is new; on a card whose "
+              "capability records are burnt already each of the three carries "
+              "its own row. `gen --mig` prints the exact count for this card")
+    disp = media.get("display") or {}
+    if disp.get("read"):
+        print("  chain1 bits 78..82 (DISPLAY/DISP_HEAD, STATUS=0x%x/0x%x): left "
+              "fused on purpose, GA100 has no display outputs"
+              % (disp["status"], disp["disp_head"]))
+    sw = media.get("sw_override") or {}
+    if sw.get("read"):
+        print("  software override: %s (FUSE_EN_SW_OVERRIDE=0x%x, DSOV/"
+              "FUSE_DIS_SW_OVR 0x820084=0x%x) -> %s"
+              % ("INERT" if sw["dead"] else "available", sw["en"], sw["dsov"],
+                 "burning FF records is the only lever" if sw["dead"]
+                 else "volatile CTRL_OPT_* writes may work, but they do not "
+                      "survive a reset"))
 
 
 def _print_devid(rep):
@@ -149,6 +210,26 @@ def _dispatch(argv=None):
     p.add_argument("--ffrows", metavar="FILE",
                    help="FF rows file to merge before planning "
                         "(see ffcalc mergeff)")
+    p.add_argument("--mig", action="store_true",
+                   help="also burn the Chain-1 floorsweep bits that hold off "
+                        "the media engines: nvdec_disable (chain1 blk8[15:11]) "
+                        "and the NVJPG/OFA pair (blk9[2] + blk23[3]). Those "
+                        "engines are physically on the die (5x NVDEC decode of "
+                        "H264/HEVC/VP9/MPEG2/JPEG -- no AV1, GA100's NVDEC "
+                        "predates the GA10x AV1 block; NVJPG0 JPEG decode; OFA0 "
+                        "optical flow) and only these fuses hold them off, so "
+                        "this is an irreversible unlock, not a settings change. "
+                        "With sys_pipe_disable=0 (already in the default plan) "
+                        "it also makes MIG usable beyond one 1g instance. Row "
+                        "cost depends on this plan: burn it together with the "
+                        "capability records and the bits ride in blocks that "
+                        "are being rewritten anyway (1 row, blk9), while a card "
+                        "whose unlock is burnt already pays one row per bit (3 "
+                        "rows, measured) -- gen prints the number for this card. "
+                        "Requires the OPT_*/STATUS_OPT_* readout (the map grew): "
+                        "a snapshot taken before it cannot prove the units are "
+                        "defect-free, and those fields are then skipped with a "
+                        "warning instead of burned blind")
     p.add_argument("--a100", action="store_true",
                    help="HIGH RISK (community-reported, not reproduced on our "
                         "cards): rewrite the FUSED device id 0x20c2 -> 0x20b5 "
@@ -180,6 +261,14 @@ def _dispatch(argv=None):
     p.add_argument("--sku", default="8gb", choices=("8gb", "10gb"))
     p.add_argument("--no-gen", action="store_true")
     p.add_argument("--skip", help="comma-separated keys to ignore in plans")
+    p.add_argument("--mig", action="store_true",
+                   help="plans also clear the media-engine floorsweep bits "
+                        "(5x NVDEC / NVJPG0 / OFA0, and multi-instance MIG "
+                        "beyond one 1g slice). Irreversible. Cost is 1 extra FF "
+                        "row when these bits ride the same round as the "
+                        "capability records, 3 rows on a card already unlocked "
+                        "(both measured); `gen --mig` prints the real number "
+                        "and what is and is not proven")
     p.add_argument("--a100", action="store_true",
                    help="HIGH RISK: plans rewrite the fused device id to "
                         "0x20b5 and the whole MAGIC_BITS_D word, which "
@@ -236,7 +325,8 @@ def _dispatch(argv=None):
         skip = args.skip.split(",") if args.skip else []
         try:
             obj = plan(dump, only=only, skip=skip,
-                       overrides=_parse_sets(args.set), a100=args.a100)
+                       overrides=_parse_sets(args.set), a100=args.a100,
+                       mig=args.mig)
         except ffrows.FFRowsNotRead as e:
             print("REFUSED: %s" % e.detail)
             print("how to fix: %s" % ffrows.GUIDANCE)
@@ -255,6 +345,7 @@ def _dispatch(argv=None):
                      rec["old"], rec["new"], ",".join(rec["fields"])))
         a = obj["analysis"]
         print("potential: %s GiB FB, %s SMs" % (a["fb_gib"], a["sm_count"]))
+        _print_media({"media": a["media"]})   # same shape as `report`
         for msg in obj["warnings"]:
             print("WARN: %s" % msg)
         return 0
@@ -305,7 +396,7 @@ def _dispatch(argv=None):
             pwarns = []
             if not args.no_gen:
                 try:
-                    obj = plan(dump, a100=args.a100,
+                    obj = plan(dump, a100=args.a100, mig=args.mig,
                                skip=args.skip.split(",") if args.skip else [])
                 except ffrows.FFRowsNotRead:
                     no_ffrows.append(dpath)

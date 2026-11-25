@@ -15,7 +15,7 @@ from ffcalc import dump as snapshot
 from ffcalc.analyze import analyze
 from ffcalc.dump import load_dump
 from ffcalc.generate import plan
-from ffcalc.optionmap import BY_KEY
+from ffcalc.optionmap import (BY_KEY, ENGINE_KEYS, ENGINE_PAIR_KEYS, FIELDS)
 from ffcalc.simulate import simulate
 
 
@@ -103,31 +103,40 @@ class TestDump(unittest.TestCase):
                              for r in obj2["burn"]))
 
     def test_default_plan_burns_the_same_records_it_always_did(self):
-        """Nothing outside --a100 may move for a user who never asks for it:
-        the rows, block values and records below are exactly what the code
-        produced before the identity rewrite existed. Only the `fields` labels
-        changed, and only to stop naming a field whose bits a record leaves
-        alone (block39 used to claim pcie_devidb)."""
+        """Nothing outside --a100/--mig may move for a user who never asks for
+        it: the records below are the ones this tool has always emitted for the
+        sample card. What changed is the sample's FF *data*: it now also carries
+        the factory media-engine bits, including one more burnt record (chain1
+        blk9 = `0x00040241`, the stock bit146), which moves the last used row
+        from 239 to 240 and so shifts every planned row by one; blk23's
+        `old`/`new` keeps bit371 fused. The burn set itself is the same 12
+        records, and no engine field appears anywhere in it."""
         obj = plan(self.dump)
         self.assertEqual(
             [(r["row"], r["chain"], r["block"], r["old"], r["new"],
               r["record"]) for r in obj["burn"]],
-            [(240, 1, 6, "0x6000", "0x0000", "0x00000181"),
-             (241, 1, 7, "0x0198", "0x0180", "0x018001c1"),
-             (242, 1, 12, "0x0606", "0x0204", "0x02040301"),
-             (243, 1, 13, "0x0707", "0x4081", "0x40810341"),
-             (244, 1, 14, "0x8787", "0x1020", "0x10200381"),
-             (245, 1, 15, "0x07c7", "0x0008", "0x000803c1"),
-             (246, 1, 19, "0x4290", "0x4200", "0x420004c1"),
-             (247, 1, 20, "0x0620", "0x0420", "0x04200501"),
-             (248, 1, 23, "0x0027", "0x0000", "0x000005c1"),
-             (249, 2, 39, "0x0002", "0x0000", "0x000009c2"),
-             (250, 2, 47, "0x0008", "0x0000", "0x00000bc2"),
-             (251, 2, 49, "0x00c0", "0x0000", "0x00000c42")])
+            [(241, 1, 6, "0x6000", "0x0000", "0x00000181"),
+             (242, 1, 7, "0x0198", "0x0180", "0x018001c1"),
+             (243, 1, 12, "0x0606", "0x0204", "0x02040301"),
+             (244, 1, 13, "0x0707", "0x4081", "0x40810341"),
+             (245, 1, 14, "0x8787", "0x1020", "0x10200381"),
+             (246, 1, 15, "0x07c7", "0x0008", "0x000803c1"),
+             (247, 1, 19, "0x4290", "0x4200", "0x420004c1"),
+             (248, 1, 20, "0x0620", "0x0420", "0x04200501"),
+             (249, 1, 23, "0x002f", "0x0008", "0x000805c1"),
+             (250, 2, 39, "0x0002", "0x0000", "0x000009c2"),
+             (251, 2, 47, "0x0008", "0x0000", "0x00000bc2"),
+             (252, 2, 49, "0x00c0", "0x0000", "0x00000c42")])
         for key in ("pcie_devida", "pcie_devidb", "magic_d"):
             self.assertNotIn(key, obj["targets"])
+        for key in ENGINE_KEYS:
+            self.assertNotIn(key, obj["targets"])
+            self.assertFalse([r for r in obj["burn"] if key in r["fields"]])
+        # blk8 (NVDEC bits) and blk9 (bit146) are left exactly as fused
+        self.assertFalse([r for r in obj["burn"] if r["block"] in (8, 9)])
         self.assertFalse([w for w in obj["warnings"]
-                          if "FUSED device id" in w or "MAGIC_BITS_D" in w])
+                          if "FUSED device id" in w or "MAGIC_BITS_D" in w
+                          or "NVDEC" in w or "SYS_PIPE" in w])
 
     def test_rows_after_last_used(self):
         obj = plan(self.dump)
@@ -270,6 +279,201 @@ class TestDump(unittest.TestCase):
         obj = plan(self.dump)
         self.assertNotIn("magic_d", obj["targets"])
         self.assertFalse([r for r in obj["burn"] if r["block"] == 46])
+
+
+class TestMediaUnlock(unittest.TestCase):
+    """`--mig`: the Chain-1 floorsweep bits on NVDEC/NVJPG/OFA.
+
+    The sample card is fused the way a stock CMP 170HX is (all 5 NVDEC bits
+    set, both NVJPG/OFA bits set), so the record values asserted below are the
+    ones a real readout replays -- and the pair bit nobody has attributed yet
+    always has to travel with its partner.
+    """
+
+    def setUp(self):
+        self.dump = load_dump(SAMPLE)
+
+    def _by_block(self, obj):
+        return dict((r["block"], r) for r in obj["burn"])
+
+    def test_mig_plan_clears_the_three_engine_bits(self):
+        obj = plan(self.dump, mig=True)
+        by_block = self._by_block(obj)
+        # NVDEC = blk8[15:11]: 0xf806 -> 0x0006, with the block's fbpa bits kept
+        self.assertEqual(by_block[8]["record"], "0x00060201")
+        self.assertEqual(by_block[8]["fields"], ["nvdec_disable"])
+        # bit146 sits alone in blk9, so it is the row that always has to be new
+        self.assertEqual(by_block[9]["record"], "0x00000241")
+        self.assertEqual(by_block[9]["fields"], ["nvjpg_ofa_disable_bit146"])
+        # bit371 rides in blk23 with nvlink and sys_pipe: one record, 3 fields
+        self.assertEqual(by_block[23]["record"], "0x000005c1")
+        self.assertEqual(set(by_block[23]["fields"]),
+                         set(("nvjpg_ofa_disable_bit371", "nvlink_disable",
+                              "sys_pipe_disable")))
+        for key in ENGINE_KEYS:
+            self.assertEqual(obj["targets"][key], "0x0")
+        res = simulate(self.dump, obj)
+        self.assertEqual(res["errors"], [])
+        self.assertEqual(res["pending"], [])
+
+    def test_mig_plan_says_what_the_bits_are_and_are_not(self):
+        warn = " ".join(plan(self.dump, mig=True)["warnings"])
+        # what the bits are, and why only an FF record moves them
+        for must in ("floorsweep", "CTRL_OPT_", "FUSE_EN_SW_OVERRIDE",
+                     "STATUS_OPT_*"):
+            self.assertIn(must, warn)
+        # what comes out of burning them, including what stays impossible
+        for must in ("5x NVDEC", "no AV1", "NVJPG0", "OFA0", "8g/4g/2g/1g",
+                     "7g"):
+            self.assertIn(must, warn)
+        # what this does not prove, and the MIG-mode reboot trap
+        for must in ("does NOT prove", "bit146/bit371", "ECC", "REBOOT"):
+            self.assertIn(must, warn)
+
+    def test_mig_row_cost_is_measured_against_this_plan(self):
+        """Not "one row" in the abstract: blocks this plan already rewrites are
+        free, and the warning names the ones that were not."""
+        warn = " ".join(plan(self.dump, mig=True)["warnings"])
+        # On the sample card gpc/fbpa need no chain1 blk8 rewrite, so NVDEC and
+        # bit146 each need a row while bit371 rides along in blk23.
+        self.assertIn("2 extra FF row(s) (chain1 blk8, chain1 blk9)", warn)
+        self.assertIn("the rest rode along in chain1 blk23", warn)
+
+    def test_a100_and_mig_compose_in_one_round(self):
+        """`--a100 --mig` is the whole unlock as one plan. The two features
+        touch different chains, so neither moves the other's records, and
+        --a100 does not make the engines cost an extra row (the baseline that
+        count is measured against already contains the identity rows). Chain 1
+        is emitted before chain 2, which is also the order worth executing in:
+        a burn interrupted between the two leaves a card that still boots as a
+        CMP 170HX with its engines unlocked, not one waiting on a vBIOS flash.
+        """
+        obj = plan(self.dump, a100=True, mig=True)
+        both, only_mig = self._by_block(obj), self._by_block(
+            plan(self.dump, mig=True))
+        only_a100 = self._by_block(plan(self.dump, a100=True))
+        for blk in (8, 9, 23):          # engine blocks: --mig's values exactly
+            self.assertEqual(both[blk]["record"], only_mig[blk]["record"])
+            self.assertEqual(sorted(both[blk]["fields"]),
+                             sorted(only_mig[blk]["fields"]))
+        for blk in (37, 38, 46, 47):    # identity/capability: --a100's exactly
+            self.assertEqual(both[blk]["record"], only_a100[blk]["record"])
+            self.assertEqual(sorted(both[blk]["fields"]),
+                             sorted(only_a100[blk]["fields"]))
+        rows = [(r["row"], r["chain"], set(r["fields"])) for r in obj["burn"]]
+        self.assertEqual([r[0] for r in rows],
+                         sorted(r[0] for r in rows))   # burntool follows order
+        engine = [r[0] for r in rows if set(ENGINE_KEYS) & r[2]]
+        ident = [r[0] for r in rows if {"pcie_devida", "pcie_devidb"} & r[2]]
+        self.assertLess(max(engine), min(ident))       # chain 1 sorts first
+        cost = [w for w in obj["warnings"] if "extra FF row" in w]
+        self.assertEqual(cost, [w for w in plan(self.dump, mig=True)["warnings"]
+                               if "extra FF row" in w])
+        self.assertEqual(simulate(self.dump, obj)["errors"], [])
+        # and planning a card never writes back into the caller's overrides
+        mine = {}
+        plan(self.dump, overrides=mine, a100=True, mig=True)
+        self.assertEqual(mine, {})
+
+    def test_row_cost_on_a_card_whose_unlock_is_already_burnt(self):
+        """Both of our cards are in this state (measured 2026-11-25): the
+        capability records are burnt, so nothing else rewrites blk8/blk23 any
+        more and every engine bit has to carry a row of its own. Pretend the
+        sample card's default plan has been burnt and ask again."""
+        rows = dict(self.dump["ff_rows"])
+        for rec in plan(self.dump)["burn"]:
+            # load_dump normalises rows to {int: int}, so the fake burn has to
+            # write the same shape it would read back.
+            rows[rec["row"]] = int(rec["record"], 16)
+        burnt = dict(self.dump, ff_rows=rows)
+        obj = plan(burnt, mig=True)
+        self.assertEqual([r["record"] for r in obj["burn"]],
+                         ["0x00060201", "0x00000241", "0x000005c1"])
+        warn = " ".join(obj["warnings"])
+        self.assertIn("3 extra FF row(s) (chain1 blk8, chain1 blk9, "
+                      "chain1 blk23)", warn)
+        self.assertIn("each engine bit carries its own row", warn)
+        self.assertEqual(simulate(burnt, obj)["errors"], [])
+
+    def test_mig_analysis_reports_the_engines(self):
+        m = plan(self.dump, mig=True)["analysis"]["media"]
+        self.assertEqual(m["mig"]["after"], 8)
+        by_label = dict((e["label"], e) for e in m["engines"])
+        self.assertEqual((by_label["NVDEC"]["now"], by_label["NVDEC"]["after"]),
+                         (0, 5))
+        for label in ("NVJPG", "OFA"):
+            self.assertEqual((by_label[label]["now"], by_label[label]["after"]),
+                             (0, 1))
+            self.assertEqual(by_label[label]["defective"], 0)
+        # the plan file carries the evidence with it, so an operator reading
+        # only the plan can see the override route was dead
+        self.assertTrue(m["sw_override"]["read"] and m["sw_override"]["dead"])
+        self.assertTrue(m["display"]["read"])
+
+    def test_mig_without_the_pair_readout_refuses_the_pair(self):
+        """No OPT_*/STATUS_OPT_* for an engine means no evidence the unit is
+        there, so no irreversible row is spent on it -- and the fields whose
+        evidence *was* read still plan normally."""
+        info = dict((k, v) for k, v in self.dump["info"].items()
+                    if k not in ("nvjpg_disable", "status_nvjpg",
+                                 "ofa_disable", "status_ofa"))
+        obj = plan(dict(self.dump, info=info), mig=True)
+        for key in ENGINE_PAIR_KEYS:
+            self.assertNotIn(key, obj["targets"])
+        self.assertIn("nvdec_disable", obj["targets"])      # its pair was read
+        by_block = self._by_block(obj)
+        self.assertEqual(by_block[8]["fields"], ["nvdec_disable"])
+        self.assertNotIn(9, by_block)
+        # blk23 is still rewritten for nvlink/sys_pipe, and with bit371 not
+        # planned that bit stays fused instead of being cleared as collateral
+        self.assertEqual(int(by_block[23]["new"], 0), 0x0008)
+        warn = " ".join(obj["warnings"])
+        self.assertIn("never read", warn)
+        self.assertIn("re-capture", warn)
+
+    def test_mig_warns_when_the_status_words_show_a_defect(self):
+        """STATUS_OPT has a bit OPT_DISABLE does not = that unit is physically
+        gone, so the unlock gets that engine one unit shorter."""
+        info = dict(self.dump["info"], nvdec_disable=0x0f, status_nvdec=0x1f)
+        rep = analyze(dict(self.dump, info=info), {"nvdec_disable": 0})
+        self.assertTrue(any("physically missing" in w for w in rep["warnings"]),
+                        rep["warnings"])
+        nvdec = [e for e in rep["media"]["engines"]
+                 if e["label"] == "NVDEC"][0]
+        self.assertEqual(nvdec["defective"], 0x10)
+        self.assertEqual(nvdec["after"], 4)     # 5 minus the one that is gone
+
+    def test_mig_report_prints_the_engine_section(self):
+        """`report` shows the engines and what the readout proves about them,
+        whether or not anything is being burnt."""
+        rc, out = quiet(["report", SAMPLE])
+        self.assertEqual(rc, 0)
+        self.assertIn("[MIG / media engines]", out)
+        self.assertIn("NVDEC  0/5 live now -> unchanged", out)
+        self.assertIn("--mig", out)
+        self.assertIn("software override: INERT", out)
+        self.assertIn("DISPLAY/DISP_HEAD", out)
+
+    def test_gen_mig_cli(self):
+        tmp = tempfile.mkdtemp(prefix="ffcalc-mig-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "plan.json")
+        rc, out = quiet(["gen", SAMPLE, "-o", path, "--mig"])
+        self.assertEqual(rc, 0)
+        with open(path) as f:
+            obj = json.load(f)
+        self.assertIn("0x00000241", [r["record"] for r in obj["burn"]])
+        self.assertIn("row cost of --mig", out)
+
+    def test_engine_proof_words_exist_in_the_readout_map(self):
+        """A proof key the probe does not read could never be satisfied, which
+        would make its field silently unplannable forever."""
+        info_map = ingest.load_map()["info"]
+        for field in FIELDS:
+            for key in field.proof_keys:
+                self.assertIn(key, info_map,
+                              "%s: proof key %s is not read by the probe"
+                              % (field.key, key))
 
 
 class TestIdentitySurface(unittest.TestCase):
@@ -635,6 +839,10 @@ class TestIngest(unittest.TestCase):
     def test_grouping(self):
         self.assertEqual(sorted(self.bybar), sorted(UUIDS))
         for lines in self.bybar.values():
+            # A real capture, taken before the OPT_/STATUS_OPT_* media-engine
+            # words were added to the map, so it is 7 words shorter than what
+            # ffprobe.ko prints today -- and ingest still builds a usable dump
+            # from it (the fields those words prove are skipped, not guessed).
             self.assertEqual(len(lines), 61)
 
     def test_dumps_distinct_uuids_and_fingerprints(self):

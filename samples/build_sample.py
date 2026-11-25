@@ -25,6 +25,35 @@ EFFECTIVE = {
     "rop_l2_disable": 0x000C40,
     "nvlink_disable": 0x7,
     "sys_pipe_disable": 0x2,
+    # Media engines fused off, exactly as every CMP 170HX read out so far looks
+    # before --mig: all 5 NVDEC disable bits set, and both NVJPG/OFA bits set.
+    # They land in chain1 blk8[15:11], blk9[2] and blk23[3]; block merging is
+    # what makes a plan write those blocks once, not three times.
+    "nvdec_disable": 0x1F,
+    "nvjpg_ofa_disable_bit146": 1,
+    "nvjpg_ofa_disable_bit371": 1,
+}
+
+# Read-only state words, as the probe reads them. STATUS_OPT_* is computed by
+# hardware as OPT_DISABLE | OPT_DEFECTIVE, so every pair below being equal is
+# the proof that clearing the floorsweep switches on real silicon -- which is
+# what these fields require before an irreversible row is spent on them.
+INFO = {
+    "secured_burn_feature_enable": 0x1,
+    "en_sw_override": 0x0,          # CTRL_OPT_* overrides are inert here
+    "dsov_status": 0x1,             # same word burntool reads as DSOV_STATUS
+    "nvdec_disable": 0x1F,
+    "status_nvdec": 0x1F,
+    "nvjpg_disable": 0x1,
+    "status_nvjpg": 0x1,
+    "ofa_disable": 0x1,
+    "status_ofa": 0x1,
+    "status_display": 0x1,          # no display outputs on GA100: left fused
+    "status_disp_head": 0xf,
+    "status_fb_config": 0x0,
+    "status_half_fbpa": 0x0,
+    "status_half_ltc": 0x0,
+    "status_pcie_lane": 0x0,
 }
 
 DEFECTIVE = {
@@ -79,10 +108,12 @@ def main():
     dump = {
         "sku": "8gb",
         "comment": "synthetic dump modeled on kate-land blog card "
-                   "(FBP_DISABLE=0x852, FBP_DEFECTIVE=0x840); FF region "
+                   "(FBP_DISABLE=0x852, FBP_DEFECTIVE=0x840), with the media "
+                   "engines fused off as on a stock CMP 170HX; FF region "
                    "fully listed, unburnt rows = 0",
         "ff_rows": snapshot.serialize_rows(rows),
         "option_words": dict(EFFECTIVE, **DEFECTIVE),
+        "info": INFO,
     }
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "blog_card_example.json")

@@ -11,6 +11,14 @@ TPC_PER_GPC = 8
 SM_PER_TPC = 2
 TOTAL_FBP = 12
 BYTES_PER_FBP = {"8gb": 8, "10gb": 4}
+# As-built counts on GA100 (NV_PTOP_SCAL_NUM_NVDECS / _NVJPGS and the 8 GR
+# entries in NV_PTOP_DEVICE_INFO2), i.e. what a cleared disable word actually
+# frees. The CMP 170HX is the same die as the A100 here: every one of these
+# blocks is present and only the floorsweep fuse says otherwise.
+TOTAL_SYS_PIPE = 8
+TOTAL_NVDEC = 5
+TOTAL_NVJPG = 1
+TOTAL_OFA = 1
 
 
 @dataclass(frozen=True)
@@ -25,6 +33,13 @@ class OptionField:
     note: str = ""
     burnable: bool = True
     opt_in: bool = False
+    # Readout words (`dump["info"]`) that carry this field's OPT_* and
+    # STATUS_OPT_* values. Only category "engine" uses them: those engines have
+    # no *_DEFECTIVE register, so STATUS_OPT_* -- which hardware computes as
+    # OPT_DISABLE | OPT_DEFECTIVE -- is the only way to see whether a block is
+    # there before spending an irreversible FF row on it. A field whose proof
+    # words were not read is skipped, not guessed at.
+    proof_keys: tuple = ()
 
 
 def _tpc_fields():
@@ -56,7 +71,57 @@ FIELDS = [
                 "NVLink additionally needs the U11 bridge mod + ROM check bypass"),
     OptionField("sys_pipe_disable", "NV_FUSE_OPT_SYS_PIPE_DISABLE",
                 1, 372, 8, "mig", "sys_pipe_defective",
-                "MIG/ECC/NVDEC unlock untested per kate-land blog"),
+                "MIG gates here; burnt 0 on our card, and a community card "
+                "reports 8-way MIG after the clear (8 SYS_PIPEs -> "
+                "8g/4g/2g/1g, more than a retail A100's 7g). ECC is a separate "
+                "question this proves nothing about"),
+    # ---- media-engine floorsweep bits (Chain 1 / TOP_FS) -----------------
+    # These engines are physically present on the die and are held off by these
+    # Chain-1 disable bits alone: not by a 10de:20c2 driver check, not by a
+    # VBIOS lock. Our own readouts prove the silicon half of that -- on both
+    # cards we captured, OPT_DISABLE == STATUS_OPT_* for all three engines, and
+    # since hardware computes STATUS_OPT = OPT | DEFECTIVE, that equality says
+    # every unit is there with no defects (the community card adds the PTOP
+    # side: NV_PTOP_DEVICE_INFO2 slots go from all-zero to 5 NVDEC + NVJPG0 +
+    # OFA0 once the bits are clear). The cheap software route is dead on
+    # datacenter GA100 (FUSE_EN_SW_OVERRIDE 0x820040 = 0, and the community
+    # checks found volatile writes to the CTRL_OPT_*/OPT_* words inert even
+    # inside Goldilocks), which is why an FF record is the only lever. opt_in
+    # for all three: the default plan does not touch one bit of them, --mig
+    # asks.
+    OptionField("nvdec_disable", "NV_FUSE_OPT_NVDEC_DISABLE",
+                1, 139, 5, "engine", "",
+                "5x hardware video decode (H264/HEVC/VP9/MPEG2/JPEG; no AV1, "
+                "GA100's NVDEC predates the GA10x AV1 block); shares chain1 "
+                "blk8 with fbpa_disable[23:21] and gpc_disable",
+                opt_in=True, proof_keys=("nvdec_disable", "status_nvdec")),
+    # bit146 and bit371 are a pair. The community bit-budget diff over three
+    # dies leaves exactly these two as the only unclaimed 1-bits in chain 1 once
+    # display and NVDEC are accounted for, and burning both took
+    # STATUS_OPT_NVJPG (0x820c0c) and STATUS_OPT_OFA (0x820e34) to 0 together --
+    # so {bit146, bit371} maps bijectively onto {NVJPG, OFA}, but which bit is
+    # which was never separated (that takes a bus reset between the two rows on
+    # the next card). We clear both together, exactly like the two
+    # DISABLE_GEN3_SPEED bits. Our own captures read both OPT words as 0x1 with
+    # STATUS equal, so both units exist on our dies and the pair costs the same
+    # one row either way. bit371 sits in blk23 next to nvlink_disable[2:0] and
+    # sys_pipe_disable[11:4], so one record writes all three fields.
+    OptionField("nvjpg_ofa_disable_bit146",
+                "NV_FUSE_OPT_NVJPG_DISABLE / NV_FUSE_OPT_OFA_DISABLE",
+                1, 146, 1, "engine", "",
+                "NVJPG/OFA pair, attribution not separated: chain1 blk9[2]; "
+                "the other half is nvjpg_ofa_disable_bit371",
+                opt_in=True,
+                proof_keys=("nvjpg_disable", "status_nvjpg", "ofa_disable",
+                            "status_ofa")),
+    OptionField("nvjpg_ofa_disable_bit371",
+                "NV_FUSE_OPT_NVJPG_DISABLE / NV_FUSE_OPT_OFA_DISABLE",
+                1, 371, 1, "engine", "",
+                "NVJPG/OFA pair, attribution not separated: chain1 blk23[3], "
+                "in the same block as nvlink_disable and sys_pipe_disable",
+                opt_in=True,
+                proof_keys=("nvjpg_disable", "status_nvjpg", "ofa_disable",
+                            "status_ofa")),
     # Device id as it is fused into the chip: lspci, the driver and the
     # vBIOS-vs-fuse boot gate compare *this*, not the ROM's own id. Chain-2
     # layout follows the community A100 conversion report (block37 = devida<<1,
@@ -108,6 +173,25 @@ FIELDS = [
 DEVID_KEYS = ("pcie_devida", "pcie_devidb")
 CMP_DEVID = 0x20C2
 A100_DEVID = 0x20B5
+
+# The three Chain-1 media-engine bits `--mig` clears (see the long comments on
+# the fields above), and the two that only mean something as a pair.
+ENGINE_KEYS = ("nvdec_disable", "nvjpg_ofa_disable_bit146",
+               "nvjpg_ofa_disable_bit371")
+ENGINE_PAIR_KEYS = ("nvjpg_ofa_disable_bit146", "nvjpg_ofa_disable_bit371")
+
+# How to describe each engine in the report: (label, OPT word, STATUS_OPT word,
+# as-built unit count, mask of the disable bits inside those words, the FF
+# field(s) that gate it). Both word names are keys into ``dump["info"]``. NVJPG
+# and OFA name the same two gating fields because those two bits have not been
+# told apart -- they are always cleared together.
+ENGINES = (
+    ("NVDEC", "nvdec_disable", "status_nvdec", TOTAL_NVDEC, 0x1f,
+     ("nvdec_disable",)),
+    ("NVJPG", "nvjpg_disable", "status_nvjpg", TOTAL_NVJPG, 0x1,
+     ENGINE_PAIR_KEYS),
+    ("OFA", "ofa_disable", "status_ofa", TOTAL_OFA, 0x1, ENGINE_PAIR_KEYS),
+)
 
 # Community guess for the whole MAGIC_BITS_D word a real A100 is said to
 # carry: UNTESTED, and the community conversion report does not touch this word
